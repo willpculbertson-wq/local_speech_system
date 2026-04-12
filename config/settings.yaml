@@ -2,10 +2,10 @@ audio:
   sample_rate: 16000        # Hz — required by both Whisper and Silero VAD
   channels: 1               # Mono only
   chunk_size: 512           # Samples per VAD frame (Silero requirement: 512 @ 16kHz)
-  device_index: null        # null = system default; set to integer to pin a device
+  device_index: 1           # Echo Cancelling Speakerphone (system default)
 
 vad:
-  threshold: 0.5            # Silero confidence threshold (0.0–1.0). Higher = less sensitive.
+  threshold: 0.3            # Silero confidence threshold (0.0–1.0). Higher = less sensitive.
   min_speech_duration_ms: 100
   min_silence_duration_ms: 700
   speech_pad_ms: 30
