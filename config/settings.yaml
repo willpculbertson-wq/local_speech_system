@@ -1,0 +1,47 @@
+audio:
+  sample_rate: 16000        # Hz — required by both Whisper and Silero VAD
+  channels: 1               # Mono only
+  chunk_size: 512           # Samples per VAD frame (Silero requirement: 512 @ 16kHz)
+  device_index: null        # null = system default; set to integer to pin a device
+
+vad:
+  threshold: 0.5            # Silero confidence threshold (0.0–1.0). Higher = less sensitive.
+  min_speech_duration_ms: 100
+  min_silence_duration_ms: 700
+  speech_pad_ms: 30
+
+transcription:
+  model_size: medium        # tiny, base, small, medium, large-v2, large-v3
+  device: auto              # auto, cuda, cpu
+  compute_type: auto        # auto → float16 (cuda) or int8 (cpu)
+  beam_size: 5
+  language: en              # null to auto-detect
+  vad_filter: false         # We handle VAD upstream; disable Whisper's internal VAD
+
+buffer:
+  max_words: 200
+  max_silence_ms: 1500
+  sentence_end_chars: []
+
+structuring:
+  enabled: true
+  ollama_url: http://localhost:11434
+  model: mistral            # must be pulled first: ollama pull mistral
+  timeout_seconds: 10
+  prompt_template: |
+    You are a transcription cleanup assistant. Fix punctuation, capitalization, and
+    sentence boundaries in the following raw speech transcription. Remove filler words
+    (um, uh, like, you know). Preserve the original meaning exactly — do not rephrase
+    or add information. Return ONLY the cleaned text with no commentary, no explanation,
+    and no quotation marks around the output.
+
+    Raw transcription:
+    {text}
+
+output:
+  method: clipboard         # clipboard (recommended) or direct_keyboard
+  paste_delay_ms: 100
+
+hotkey:
+  toggle: ctrl+`
+  cancel: escape

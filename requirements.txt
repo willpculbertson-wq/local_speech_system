@@ -1,0 +1,32 @@
+# Local Speech Dictation System — Python Dependencies
+#
+# IMPORTANT: torch must be installed separately with the CUDA index URL.
+# See README.md for the complete setup instructions.
+#
+# Do NOT run plain `pip install -r requirements.txt` — torch will install
+# the CPU-only build. Follow the README steps in order.
+
+# --- Speech recognition ---
+faster-whisper>=1.0.0
+
+# --- Voice activity detection ---
+silero-vad>=5.1.0
+
+# --- Audio capture ---
+sounddevice>=0.4.6
+numpy>=1.24.0
+
+# --- PyTorch (installed separately — see README) ---
+# torch>=2.2.0
+# torchaudio>=2.2.0
+
+# --- OS output injection ---
+pyperclip>=1.8.2
+pyautogui>=0.9.54
+keyboard>=0.13.5
+
+# --- Config ---
+pyyaml>=6.0.1
+
+# --- Ollama HTTP client ---
+requests>=2.31.0
