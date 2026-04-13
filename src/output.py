@@ -34,6 +34,9 @@ class OutputInjector:
         if not text.strip():
             return
 
+        # Prepend a space so consecutive injections don't run together
+        text = ' ' + text.strip()
+
         if self.method == 'clipboard':
             self._inject_via_clipboard(text)
         else:

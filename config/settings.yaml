@@ -20,11 +20,11 @@ transcription:
 
 buffer:
   max_words: 200
-  max_silence_ms: 800
+  max_silence_ms: 3000
   sentence_end_chars: []
 
 structuring:
-  enabled: false
+  enabled: true
   ollama_url: http://localhost:11434
   model: mistral            # must be pulled first: ollama pull mistral
   timeout_seconds: 10
