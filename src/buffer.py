@@ -77,14 +77,18 @@ class TranscriptionBuffer(threading.Thread):
                     self._flush('sentence_boundary')
                     continue
 
-            # Flush on silence timeout
+            # Flush on silence timeout — check under lock, flush outside it
+            # (Lock is not reentrant; _flush() also acquires it)
+            should_flush = False
             with self._buffer_lock:
                 if (
                     self._buffer
                     and self._last_input_time > 0
                     and time.monotonic() - self._last_input_time > self.max_silence_s
                 ):
-                    self._flush('silence_timeout')
+                    should_flush = True
+            if should_flush:
+                self._flush('silence_timeout')
 
     def stop(self):
         self._stop_event.set()
@@ -109,7 +113,7 @@ class TranscriptionBuffer(threading.Thread):
             return
 
         word_count = len(combined.split())
-        logging.debug(f"Buffer flush ({reason}): {word_count} words")
+        logging.info(f"Buffer flush ({reason}): {word_count} words → sending to output")
 
         try:
             self.output_queue.put(combined, timeout=2.0)

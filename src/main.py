@@ -92,8 +92,14 @@ class OutputPipeline(threading.Thread):
             if text is None:  # Shutdown sentinel
                 break
 
-            cleaned = self.structurer.process(text)
-            self.injector.inject(cleaned)
+            try:
+                logging.info(f"OutputPipeline: received text ({len(text.split())} words)")
+                cleaned = self.structurer.process(text)
+                logging.info(f"OutputPipeline: structured, injecting...")
+                self.injector.inject(cleaned)
+                logging.info(f"OutputPipeline: injection complete")
+            except Exception as e:
+                logging.error(f"OutputPipeline crashed: {e}", exc_info=True)
 
     def stop(self):
         self._stop_event.set()
