@@ -127,6 +127,19 @@ class StreamingState:
         with self._lock:
             return self._pre_preview_last_char
 
+    def on_flush_complete(self, last_char: str | None):
+        """Called after each final inject to prepare for the next flush cycle.
+
+        Updates _pre_preview_last_char so the next cycle's set_last_char() call
+        restores the correct context (the char after the previous clean inject,
+        not the char from the start of the session).
+
+        Also resets _first_preview so the next preview batch gets a fresh ### marker.
+        """
+        with self._lock:
+            self._pre_preview_last_char = last_char
+            self._first_preview = True
+
     def reset_cancel(self):
         """Called at the start of a new listening session."""
         with self._lock:
@@ -231,6 +244,8 @@ class OutputPipeline(threading.Thread):
         logging.info("OutputPipeline: injecting cleaned text")
         self.injector.inject(cleaned)
         logging.info("OutputPipeline: final injection complete")
+        # Prepare context for the next flush cycle within this session
+        self.streaming_state.on_flush_complete(self.injector._last_injected_char)
 
     def stop(self):
         self._stop_event.set()
