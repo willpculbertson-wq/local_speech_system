@@ -177,6 +177,9 @@ class OutputPipeline(threading.Thread):
         self.injector = injector
         self.streaming_state = streaming_state
         self.indicator = indicator
+        # Set False by DictationSystem._stop_listening() so _restart_dots()
+        # does not fire after the final flush once the user has toggled off.
+        self._restart_indicator_after_inject: bool = False
         self._stop_event = threading.Event()
 
     def run(self):
@@ -206,11 +209,12 @@ class OutputPipeline(threading.Thread):
                     logging.info("OutputPipeline: structured, injecting...")
                     self.injector.inject(cleaned)
                     logging.info("OutputPipeline: injection complete")
+                    self._restart_dots()
             except Exception as e:
                 logging.error(f"OutputPipeline crashed: {e}", exc_info=True)
 
     def _clear_indicator(self):
-        """Delete any indicator dots and restore pre-indicator context.
+        """Delete any indicator chars and restore pre-indicator context.
         Idempotent — safe to call even if indicator already stopped or never started."""
         if self.indicator is None:
             return
@@ -219,6 +223,12 @@ class OutputPipeline(threading.Thread):
             self.injector.delete_chars(chars)
             self.injector.set_last_char(pre_char)
             logging.debug(f"OutputPipeline: cleared {chars} indicator chars")
+
+    def _restart_dots(self):
+        """Start stacking dots after a successful injection (still listening).
+        Skipped if _stop_listening() has already cleared the restart flag."""
+        if self.indicator is not None and self._restart_indicator_after_inject:
+            self.indicator.start_dots()
 
     def _handle_preview(self, text: str):
         self._clear_indicator()
@@ -240,6 +250,7 @@ class OutputPipeline(threading.Thread):
 
         if self.streaming_state is None:
             self.injector.inject(cleaned)
+            self._restart_dots()
             return
 
         chars_to_delete, was_cancelled = self.streaming_state.consume_if_not_cancelled()
@@ -260,6 +271,7 @@ class OutputPipeline(threading.Thread):
         logging.info("OutputPipeline: injecting cleaned text")
         self.injector.inject(cleaned)
         logging.info("OutputPipeline: final injection complete")
+        self._restart_dots()
         # Prepare context for the next flush cycle within this session
         self.streaming_state.on_flush_complete(self.injector._last_injected_char)
 
@@ -377,6 +389,7 @@ class DictationSystem:
                 self._vad.reset()
                 # Clear the buffer without flushing to output
                 self._buffer._buffer.clear()
+                self._output_pipeline._restart_indicator_after_inject = False
                 # Stop indicator and delete any dots already on screen
                 if self._indicator is not None:
                     ind_chars, ind_pre = self._indicator.stop()
@@ -401,8 +414,10 @@ class DictationSystem:
         if self._streaming_state is not None:
             self._streaming_state.reset_cancel()
         self._audio.start()
+        # Allow OutputPipeline to restart dots after each injection this session.
+        self._output_pipeline._restart_indicator_after_inject = True
         if self._indicator is not None:
-            self._indicator.start()
+            self._indicator.start_listening()
         logging.info("=== LISTENING ON ===  (press Ctrl+` to stop)")
         print("\n[LISTENING]", flush=True)
 
@@ -410,6 +425,10 @@ class DictationSystem:
         self._listening = False
         self._audio.stop()
         self._vad.reset()
+        # Prevent OutputPipeline from restarting dots after the final flush.
+        # Must be set before flush_now() so that any _handle_final that fires
+        # during the flush sees the flag as False.
+        self._output_pipeline._restart_indicator_after_inject = False
         # Clear indicator now — covers the empty-buffer case where _handle_final
         # never fires (buffer was empty). If buffer is non-empty, OutputPipeline
         # also calls _clear_indicator() before injecting (idempotent, no-op).
