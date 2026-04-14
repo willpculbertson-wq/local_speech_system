@@ -107,7 +107,10 @@ class OutputInjector:
             final = prefix + body
         else:
             last = self._last_injected_char
-            if last is None or last in '\n\r':
+            if body[0] in '.!?,;:)':
+                # Punctuation attaches to the preceding word — no leading space
+                final = body
+            elif last is None or last in '\n\r':
                 final = _capitalize_first(body)
             elif last in '.!?':
                 final = ' ' + _capitalize_first(body)
