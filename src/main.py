@@ -59,7 +59,7 @@ def setup_logging(debug: bool = False):
     ]
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
     # Suppress noisy third-party loggers at debug level
-    for name in ('faster_whisper', 'silero_vad', 'urllib3', 'httpx'):
+    for name in ('faster_whisper', 'silero_vad', 'urllib3', 'httpx', 'comtypes'):
         logging.getLogger(name).setLevel(logging.WARNING)
 
 
@@ -371,6 +371,17 @@ class DictationSystem:
         self._vad.reset()
         if self._streaming_state is not None:
             self._streaming_state.reset_cancel()
+
+        # Read the character actually left of the cursor so spacing/capitalisation
+        # is correct regardless of where the user has navigated in the document.
+        from cursor_context import get_preceding_char
+        ctx = get_preceding_char()
+        self._injector.set_last_char(ctx)   # None = safe default (cap, no space)
+        if self._streaming_state is not None and ctx is not None:
+            # Also prime streaming state so the first-cycle final inject uses it.
+            self._streaming_state.save_pre_preview_char(ctx)
+        logging.debug(f"Listening start: cursor preceding char = {ctx!r}")
+
         self._audio.start()
         logging.info("=== LISTENING ON ===  (press Ctrl+` to stop)")
         print("\n[LISTENING]", flush=True)
