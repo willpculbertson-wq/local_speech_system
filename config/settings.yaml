@@ -44,7 +44,7 @@ structuring:
 output:
   method: sendinput         # sendinput (recommended), clipboard, or direct_keyboard
   paste_delay_ms: 100       # only used when method: clipboard
-  streaming_preview: true  # set true to inject raw text immediately, then replace with cleaned version
+  streaming_preview: false  # debug only: set true to show raw preview text (### markers) then replace with cleaned version
 
 hotkey:
   toggle: ctrl+`

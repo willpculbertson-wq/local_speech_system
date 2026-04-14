@@ -209,9 +209,9 @@ class OutputPipeline(threading.Thread):
     def _handle_preview(self, text: str):
         logging.debug(f"OutputPipeline: preview {text!r}")
         if self.streaming_state is not None and self.streaming_state.take_first_preview():
-            # Save injector context so we can restore it before the final inject
-            self.streaming_state.save_pre_preview_char(self.injector._last_injected_char)
-            # Open with ### to signal "still processing"
+            # Open with ### to signal "still processing".
+            # Pre-preview context comes from reset_cancel() (None = fresh session start)
+            # or on_flush_complete() (correct context after each flush cycle).
             chars = self.injector.inject(text, prefix='### ')
         else:
             chars = self.injector.inject(text)
