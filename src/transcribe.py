@@ -15,12 +15,13 @@ Key notes:
 
 import logging
 import queue
+import re
 import threading
 
 import numpy as np
 
 
-# Known Whisper hallucination artifacts to discard.
+# Complete outputs to discard entirely — the whole transcription is an artifact.
 _HALLUCINATIONS = frozenset({
     '[blank_audio]',
     '(music)',
@@ -40,6 +41,20 @@ _HALLUCINATIONS = frozenset({
     '.',
     '',
 })
+
+# Phrases to strip when they appear INLINE within a real transcription.
+# Whisper sometimes injects these mid-sentence rather than as the full output.
+# Each entry is compiled as a whole-word, case-insensitive pattern.
+_INLINE_HALLUCINATIONS: tuple[re.Pattern, ...] = tuple(
+    re.compile(r'\s*\b' + re.escape(p) + r'\b\s*', re.IGNORECASE)
+    for p in (
+        'thank you very much',
+        'have a good one',
+        'thanks for watching',
+        'please subscribe',
+        'like and subscribe',
+    )
+)
 
 
 def _resolve_device_and_compute(config: dict) -> tuple[str, str]:
@@ -140,10 +155,18 @@ class TranscriptionWorker(threading.Thread):
             logging.error(f"Transcription error: {e}", exc_info=True)
             return
 
-        # Filter known hallucination artifacts
+        # Filter known hallucination artifacts — exact whole-output match
         if full_text.strip().lower() in _HALLUCINATIONS:
             logging.debug(f"Filtered hallucination: {full_text!r}")
             return
+
+        # Strip inline hallucination phrases injected mid-sentence
+        original = full_text
+        for pattern in _INLINE_HALLUCINATIONS:
+            full_text = pattern.sub(' ', full_text)
+        full_text = re.sub(r' {2,}', ' ', full_text).strip()
+        if full_text != original:
+            logging.debug(f"Stripped inline hallucination: {original!r} → {full_text!r}")
 
         if not full_text.strip():
             return
