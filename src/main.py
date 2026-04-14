@@ -169,12 +169,14 @@ class OutputPipeline(threading.Thread):
         structurer,
         injector,
         streaming_state: StreamingState | None = None,
+        indicator=None,  # TypingIndicator | None
     ):
         super().__init__(name='OutputThread', daemon=True)
         self.input_queue = input_queue
         self.structurer = structurer
         self.injector = injector
         self.streaming_state = streaming_state
+        self.indicator = indicator
         self._stop_event = threading.Event()
 
     def run(self):
@@ -199,6 +201,7 @@ class OutputPipeline(threading.Thread):
                 else:
                     # Non-streaming: plain string
                     logging.info(f"OutputPipeline: received text ({len(msg.split())} words)")
+                    self._clear_indicator()
                     cleaned = self.structurer.process(msg)
                     logging.info("OutputPipeline: structured, injecting...")
                     self.injector.inject(cleaned)
@@ -206,7 +209,19 @@ class OutputPipeline(threading.Thread):
             except Exception as e:
                 logging.error(f"OutputPipeline crashed: {e}", exc_info=True)
 
+    def _clear_indicator(self):
+        """Delete any indicator dots and restore pre-indicator context.
+        Idempotent — safe to call even if indicator already stopped or never started."""
+        if self.indicator is None:
+            return
+        chars, pre_char = self.indicator.stop()
+        if chars > 0:
+            self.injector.delete_chars(chars)
+            self.injector.set_last_char(pre_char)
+            logging.debug(f"OutputPipeline: cleared {chars} indicator chars")
+
     def _handle_preview(self, text: str):
+        self._clear_indicator()
         logging.debug(f"OutputPipeline: preview {text!r}")
         if self.streaming_state is not None and self.streaming_state.take_first_preview():
             # Open with ### to signal "still processing".
@@ -219,6 +234,7 @@ class OutputPipeline(threading.Thread):
             self.streaming_state.add_chars(chars)
 
     def _handle_final(self, text: str):
+        self._clear_indicator()
         logging.info(f"OutputPipeline: final flush ({len(text.split())} words), structuring...")
         cleaned = self.structurer.process(text)
 
@@ -265,12 +281,14 @@ class DictationSystem:
         # Import here so errors surface at startup with a clear message
         from audio import AudioCapture
         from buffer import TranscriptionBuffer
+        from indicator import TypingIndicator
         from output import OutputInjector
         from structure import TextStructurer
         from transcribe import TranscriptionWorker
         from vad import VADProcessor
 
         streaming_enabled: bool = config.get('output', {}).get('streaming_preview', False)
+        indicator_enabled: bool = config.get('output', {}).get('typing_indicator', True)
 
         # Inter-thread queues (maxsize=50 provides backpressure)
         self._audio_queue: queue.Queue = queue.Queue(maxsize=50)
@@ -295,9 +313,13 @@ class DictationSystem:
         )
         self._structurer = TextStructurer(config['structuring'])
         self._injector = OutputInjector(config['output'])
+        self._indicator: TypingIndicator | None = (
+            TypingIndicator(self._injector) if indicator_enabled else None
+        )
         self._output_pipeline = OutputPipeline(
             self._output_queue, self._structurer, self._injector,
             streaming_state=self._streaming_state,
+            indicator=self._indicator,
         )
 
     # ------------------------------------------------------------------
@@ -355,7 +377,14 @@ class DictationSystem:
                 self._vad.reset()
                 # Clear the buffer without flushing to output
                 self._buffer._buffer.clear()
-                # Delete any preview chars already injected onto screen
+                # Stop indicator and delete any dots already on screen
+                if self._indicator is not None:
+                    ind_chars, ind_pre = self._indicator.stop()
+                    if ind_chars > 0:
+                        logging.info(f"cancel_listening: deleting {ind_chars} indicator chars")
+                        self._injector.delete_chars(ind_chars)
+                        self._injector.set_last_char(ind_pre)
+                # Delete any streaming preview chars already injected onto screen
                 if self._streaming_state is not None:
                     chars = self._streaming_state.cancel_and_consume()
                     if chars > 0:
@@ -372,6 +401,8 @@ class DictationSystem:
         if self._streaming_state is not None:
             self._streaming_state.reset_cancel()
         self._audio.start()
+        if self._indicator is not None:
+            self._indicator.start()
         logging.info("=== LISTENING ON ===  (press Ctrl+` to stop)")
         print("\n[LISTENING]", flush=True)
 
@@ -379,6 +410,14 @@ class DictationSystem:
         self._listening = False
         self._audio.stop()
         self._vad.reset()
+        # Clear indicator now — covers the empty-buffer case where _handle_final
+        # never fires (buffer was empty). If buffer is non-empty, OutputPipeline
+        # also calls _clear_indicator() before injecting (idempotent, no-op).
+        if self._indicator is not None:
+            chars, pre_char = self._indicator.stop()
+            if chars > 0:
+                self._injector.delete_chars(chars)
+                self._injector.set_last_char(pre_char)
         # Flush any accumulated text in the buffer
         self._buffer.flush_now()
         logging.info("=== LISTENING OFF ===")

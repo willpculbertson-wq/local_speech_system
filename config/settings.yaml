@@ -45,6 +45,7 @@ output:
   method: sendinput         # sendinput (recommended), clipboard, or direct_keyboard
   paste_delay_ms: 100       # only used when method: clipboard
   streaming_preview: false  # debug only: set true to show raw preview text (### markers) then replace with cleaned version
+  typing_indicator: true    # show animated dots (·) at cursor while waiting for transcription
 
 hotkey:
   toggle: ctrl+`

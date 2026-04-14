@@ -17,13 +17,16 @@ import logging
 _available: bool | None = None
 
 
-def get_preceding_char() -> str | None:
-    """Return the character immediately left of the insertion cursor.
+def get_preceding_chars(n: int = 2) -> str | None:
+    """Return up to *n* characters immediately left of the insertion cursor.
 
     Queries the currently focused UI element via UIAutomation ITextPattern.
+    Asking for 2 characters (the default) allows callers to distinguish
+    e.g. '. ' (sentence end + space → capitalise) from 'e ' (mid-sentence
+    + space → no capitalise), which a single character cannot.
 
     Returns:
-        A single character string, or None if:
+        A string of 1–n characters, or None if:
           - comtypes is not installed
           - the focused element does not expose ITextPattern (e.g. a terminal)
           - the cursor is at the very start of the document
@@ -35,7 +38,7 @@ def get_preceding_char() -> str | None:
         return None
 
     try:
-        result = _read_via_uia()
+        result = _read_via_uia(n)
         _available = True
         return result
     except ImportError:
@@ -65,7 +68,7 @@ def _ensure_typelib():
         comtypes.client.GetModule('UIAutomationCore.dll')
 
 
-def _read_via_uia() -> str | None:
+def _read_via_uia(n: int) -> str | None:
     import ctypes
     import comtypes
     import comtypes.client
@@ -107,11 +110,13 @@ def _read_via_uia() -> str | None:
 
     cursor_range = sel.GetElement(0)
 
-    # Move the START endpoint one character to the left.
-    # Endpoint_Start=0, TextUnit_Character=1, count=-1
-    moved = cursor_range.MoveEndpointByUnit(0, 1, -1)
+    # Move the START endpoint n characters to the left.
+    # Endpoint_Start=0, TextUnit_Character=1
+    # MoveEndpointByUnit returns the number of units actually moved;
+    # it may be less than n if the cursor is near the start of the document.
+    moved = cursor_range.MoveEndpointByUnit(0, 1, -n)
     if moved == 0:
         return None  # Already at start of document
 
-    char = cursor_range.GetText(1)
-    return char if char else None
+    chars = cursor_range.GetText(n)
+    return chars if chars else None

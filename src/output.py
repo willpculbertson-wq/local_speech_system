@@ -5,13 +5,25 @@ Primary method: Win32 SendInput with KEYEVENTF_UNICODE.
 Sends characters directly as Unicode key events — no clipboard involved, no
 timing races, no interference with clipboard contents.
 
-inject() is context-aware: it inspects the last character it injected and
-decides the appropriate prefix and capitalisation for the new text:
-  • previous char is space  → no extra space, no capitalisation (mid-sentence)
-  • previous char is .!?    → add a space, capitalise first word (new sentence)
-  • previous char is \\n/\\r  → no space, capitalise first word (new line/paragraph)
-  • previous char is other  → add a space, no capitalisation (mid-word continuation)
-  • no previous char (None) → no space, capitalise (start of document / unknown)
+inject() reads up to 2 characters immediately left of the cursor via
+UIAutomation right before injecting, then applies grammatical rules:
+
+  Two-char context (preferred — from UIAutomation):
+    '. '  '! '  '? '  → no space, capitalise   (new sentence after punct+space)
+    '• '  '* '        → no space, capitalise   (after bullet + space)
+    '\\n'  '\\n '       → no space, capitalise   (new line / paragraph)
+    any letter + ' '  → no space, no cap       (mid-sentence continuation)
+    ': '  '; '  '- '  → no space, no cap       (after colon / semicolon / dash)
+    '— '  '… '        → no space, no cap       (after em-dash / ellipsis)
+
+  Single-char fallback (from _last_injected_char tracking):
+    .!?   → space + capitalise
+    \\n/\\r → no space + capitalise
+    space → no space, no cap
+    other → space, no cap
+    None  → no space, capitalise  (start of doc / unknown)
+
+  Body starting with punctuation (.!?,;:)) → always attach directly, no space.
 
 Fallback: clipboard + Ctrl+V (legacy, kept for edge-case compatibility).
 Final fallback: direct keyboard typing via keyboard.write() (ASCII-only).
@@ -21,6 +33,8 @@ import ctypes
 import ctypes.wintypes
 import logging
 import threading
+
+from cursor_context import get_preceding_chars
 
 
 # ---------------------------------------------------------------------------
@@ -58,6 +72,58 @@ _INPUT_SIZE = ctypes.sizeof(_INPUT)
 
 def _capitalize_first(text: str) -> str:
     return text[0].upper() + text[1:] if text else text
+
+
+def _get_injection_prefix(chars: str | None, body: str) -> str:
+    """Return the full string to inject: leading space/cap + body.
+
+    chars: up to 2 characters immediately before the cursor (UIAutomation),
+           or a single tracked character, or None.
+    body:  stripped text to inject.
+
+    Grammatical rules applied in priority order:
+      1. Body starts with punctuation → attach directly (no space, no cap).
+      2. No context (None / empty) → capitalise, no space (start of doc).
+      3. Cursor after space:
+           - preceded by .!? or newline or bullet (•*) → capitalise
+           - preceded by anything else (letter, -:;—…,) → no cap
+         Either way: no additional space (one is already there).
+      4. Cursor after newline → capitalise, no space.
+      5. Cursor right after .!? (no space yet) → space + capitalise.
+      6. Cursor after continuation punctuation (,:;-—…) → space, no cap.
+      7. Cursor after any other character → space, no cap.
+    """
+    # Rule 1 — punctuation body
+    if body[0] in '.!?,;:)':
+        return body
+
+    # Rule 2 — unknown / start of document
+    if not chars:
+        return _capitalize_first(body)
+
+    last = chars[-1]                              # char immediately left of cursor
+    prev = chars[-2] if len(chars) >= 2 else ''  # char before that
+
+    # Rule 3 — cursor is after a space
+    if last in ' \t':
+        if prev in '.!?' or prev in '\n\r' or prev in '•*':
+            return _capitalize_first(body)        # new sentence / after bullet
+        return body                               # mid-sentence continuation
+
+    # Rule 4 — cursor after newline (new paragraph / line)
+    if last in '\n\r':
+        return _capitalize_first(body)
+
+    # Rule 5 — cursor right after sentence-ending punctuation (no space yet)
+    if last in '.!?':
+        return ' ' + _capitalize_first(body)
+
+    # Rule 6 — continuation punctuation (comma, colon, semicolon, dash, em-dash, ellipsis)
+    if last in ',:;-—…':
+        return ' ' + body
+
+    # Rule 7 — regular character (letter, digit, quote, paren, etc.)
+    return ' ' + body
 
 
 class OutputInjector:
@@ -111,23 +177,11 @@ class OutputInjector:
             # and transcription take 1-5 s), so this read is accurate regardless
             # of where the user navigated since the last session.
             # Falls back silently to tracked _last_injected_char on any failure.
-            from cursor_context import get_preceding_char
-            ctx = get_preceding_char()
+            ctx = get_preceding_chars(2)
             if ctx is not None:
-                self._last_injected_char = ctx
-
-            last = self._last_injected_char
-            if body[0] in '.!?,;:)':
-                # Punctuation attaches to the preceding word — no leading space
-                final = body
-            elif last is None or last in '\n\r':
-                final = _capitalize_first(body)
-            elif last in '.!?':
-                final = ' ' + _capitalize_first(body)
-            elif last == ' ':
-                final = body
-            else:
-                final = ' ' + body
+                self._last_injected_char = ctx[-1]
+            chars_for_logic = ctx if ctx is not None else self._last_injected_char
+            final = _get_injection_prefix(chars_for_logic, body)
 
         self._send(final)
         if final:
