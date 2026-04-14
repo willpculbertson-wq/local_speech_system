@@ -5,6 +5,14 @@ Primary method: Win32 SendInput with KEYEVENTF_UNICODE.
 Sends characters directly as Unicode key events — no clipboard involved, no
 timing races, no interference with clipboard contents.
 
+inject() is context-aware: it inspects the last character it injected and
+decides the appropriate prefix and capitalisation for the new text:
+  • previous char is space  → no extra space, no capitalisation (mid-sentence)
+  • previous char is .!?    → add a space, capitalise first word (new sentence)
+  • previous char is \\n/\\r  → no space, capitalise first word (new line/paragraph)
+  • previous char is other  → add a space, no capitalisation (mid-word continuation)
+  • no previous char (None) → no space, capitalise (start of document / unknown)
+
 Fallback: clipboard + Ctrl+V (legacy, kept for edge-case compatibility).
 Final fallback: direct keyboard typing via keyboard.write() (ASCII-only).
 """
@@ -48,67 +56,88 @@ _SendInput = ctypes.windll.user32.SendInput
 _INPUT_SIZE = ctypes.sizeof(_INPUT)
 
 
+def _capitalize_first(text: str) -> str:
+    return text[0].upper() + text[1:] if text else text
+
+
 class OutputInjector:
     def __init__(self, config: dict):
         self.method: str = config.get('method', 'sendinput')
         self.paste_delay: float = config.get('paste_delay_ms', 100) / 1000.0
         self._lock = threading.Lock()
-        self._suppress_next_space: bool = False
+        # Last character we injected — drives context-aware spacing/capitalisation.
+        # None means "unknown / start of document".
+        self._last_injected_char: str | None = None
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    def suppress_leading_space(self):
-        """Suppress the space prefix on the next inject() call.
+    def set_last_char(self, char: str | None):
+        """Override the tracked last-injected character.
 
-        Call before each dictation session so the first word doesn't start with
-        a space when the cursor is already at the beginning of a line.
-        Only affects inject() with no explicit prefix — has no effect on
-        inject(text, prefix='...') or _inject_raw().
+        Call this before inject() when the injector's internal state is stale
+        — e.g. after deleting preview chars in streaming mode, the cursor has
+        moved back and the preceding character is whatever was there before the
+        preview started.
         """
-        self._suppress_next_space = True
+        self._last_injected_char = char
 
     def inject(self, text: str, prefix: str | None = None) -> int:
-        """Inject text into the active window.
+        """Inject text into the active window with context-aware spacing/capitalisation.
 
-        prefix: string prepended to the text (default ' ' to separate from prior
-                text). Pass an explicit value to override, e.g. prefix='### '.
-                When prefix is None the suppress_leading_space flag is consulted.
-        Returns the number of characters injected (including the prefix).
+        prefix: when supplied explicitly (e.g. '### ' for streaming previews)
+                the caller controls everything and context logic is bypassed.
+                When None (default), the preceding-character rules apply:
+                  space  → no extra space, no cap   (mid-sentence continuation)
+                  .!?    → space + capitalise        (new sentence)
+                  \\n/\\r  → no space + capitalise    (new line / paragraph)
+                  other  → space, no cap             (mid-word continuation)
+                  None   → no space + capitalise     (unknown / start of doc)
+
+        Returns the number of characters injected.
         """
         if not text.strip():
             return 0
 
-        if prefix is None:
-            if self._suppress_next_space:
-                prefix = ''
-                self._suppress_next_space = False
-            else:
-                prefix = ' '
+        body = text.strip()
 
-        text = prefix + text.strip()
-
-        if self.method == 'clipboard':
-            self._inject_via_clipboard(text)
-        elif self.method == 'direct_keyboard':
-            self._inject_via_keyboard(text)
+        if prefix is not None:
+            # Explicit prefix — caller controls spacing and capitalisation entirely
+            final = prefix + body
         else:
-            self._inject_via_sendinput(text)
+            last = self._last_injected_char
+            if last is None or last in '\n\r':
+                final = _capitalize_first(body)
+            elif last in '.!?':
+                final = ' ' + _capitalize_first(body)
+            elif last == ' ':
+                final = body
+            else:
+                final = ' ' + body
 
-        return len(text)
+        self._send(final)
+        if final:
+            self._last_injected_char = final[-1]
+        return len(final)
 
     def _inject_raw(self, text: str) -> int:
-        """Inject text with no prefix at all. Returns char count."""
+        """Inject text exactly as given, with no prefix or capitalisation changes."""
         if not text:
             return 0
+        self._send(text)
+        if text:
+            self._last_injected_char = text[-1]
+        return len(text)
+
+    def _send(self, text: str):
+        """Dispatch to the configured injection backend."""
         if self.method == 'clipboard':
             self._inject_via_clipboard(text)
         elif self.method == 'direct_keyboard':
             self._inject_via_keyboard(text)
         else:
             self._inject_via_sendinput(text)
-        return len(text)
 
     def delete_chars(self, n: int):
         """Delete n characters left of the cursor via a batched Win32 SendInput call."""

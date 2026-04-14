@@ -79,6 +79,9 @@ class StreamingState:
         self._pending_chars: int = 0
         self._cancelled: bool = False
         self._first_preview: bool = True
+        # The injector's last-char state immediately before the first preview was
+        # injected. Restored before the final inject so context is correct.
+        self._pre_preview_last_char: str | None = None
 
     def add_chars(self, n: int):
         with self._lock:
@@ -116,12 +119,21 @@ class StreamingState:
                 return True
             return False
 
+    def save_pre_preview_char(self, char: str | None):
+        with self._lock:
+            self._pre_preview_last_char = char
+
+    def get_pre_preview_char(self) -> str | None:
+        with self._lock:
+            return self._pre_preview_last_char
+
     def reset_cancel(self):
         """Called at the start of a new listening session."""
         with self._lock:
             self._cancelled = False
             self._pending_chars = 0
             self._first_preview = True
+            self._pre_preview_last_char = None
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +195,10 @@ class OutputPipeline(threading.Thread):
 
     def _handle_preview(self, text: str):
         logging.debug(f"OutputPipeline: preview {text!r}")
-        # First preview of a session opens with ### to signal "still processing"
         if self.streaming_state is not None and self.streaming_state.take_first_preview():
+            # Save injector context so we can restore it before the final inject
+            self.streaming_state.save_pre_preview_char(self.injector._last_injected_char)
+            # Open with ### to signal "still processing"
             chars = self.injector.inject(text, prefix='### ')
         else:
             chars = self.injector.inject(text)
@@ -211,6 +225,8 @@ class OutputPipeline(threading.Thread):
             chars_to_delete += close
             logging.info(f"OutputPipeline: deleting {chars_to_delete} preview chars (incl. markers)")
             self.injector.delete_chars(chars_to_delete)
+            # Restore the injector's context to what it was before the preview started
+            self.injector.set_last_char(self.streaming_state.get_pre_preview_char())
 
         logging.info("OutputPipeline: injecting cleaned text")
         self.injector.inject(cleaned)
@@ -340,9 +356,6 @@ class DictationSystem:
         self._vad.reset()
         if self._streaming_state is not None:
             self._streaming_state.reset_cancel()
-        else:
-            # Non-streaming: suppress the leading space so lines don't start with ' '
-            self._injector.suppress_leading_space()
         self._audio.start()
         logging.info("=== LISTENING ON ===  (press Ctrl+` to stop)")
         print("\n[LISTENING]", flush=True)

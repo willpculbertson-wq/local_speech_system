@@ -87,18 +87,18 @@ def _fix_punctuation_spacing(text: str) -> str:
 
 
 def _capitalize_sentences(text: str) -> str:
-    """Capitalize the first letter of the text and after each sentence-ending mark."""
+    """Capitalize the first letter after each in-text sentence-ending mark.
+
+    First-word capitalization is intentionally omitted here — it is handled by
+    OutputInjector.inject() which has context about the preceding character.
+    """
     if not text:
         return text
-    # Capitalize very first character
-    text = text[0].upper() + text[1:]
-    # Capitalize the first letter following '. ', '! ', or '? '
-    text = re.sub(
+    return re.sub(
         r'([.!?]\s+)([a-z])',
         lambda m: m.group(1) + m.group(2).upper(),
         text,
     )
-    return text
 
 
 def _python_format(text: str) -> str:
