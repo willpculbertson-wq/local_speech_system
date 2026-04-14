@@ -106,6 +106,16 @@ class OutputInjector:
             # Explicit prefix — caller controls spacing and capitalisation entirely
             final = prefix + body
         else:
+            # Refresh cursor context from UIAutomation right before injecting.
+            # By inject() time the text editor is reliably focused (audio capture
+            # and transcription take 1-5 s), so this read is accurate regardless
+            # of where the user navigated since the last session.
+            # Falls back silently to tracked _last_injected_char on any failure.
+            from cursor_context import get_preceding_char
+            ctx = get_preceding_char()
+            if ctx is not None:
+                self._last_injected_char = ctx
+
             last = self._last_injected_char
             if body[0] in '.!?,;:)':
                 # Punctuation attaches to the preceding word — no leading space
