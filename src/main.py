@@ -64,42 +64,157 @@ def setup_logging(debug: bool = False):
 
 
 # ---------------------------------------------------------------------------
+# StreamingState — thread-safe tracker for preview-mode pending chars
+# ---------------------------------------------------------------------------
+
+class StreamingState:
+    """Tracks how many characters have been injected as preview text.
+
+    Used by OutputPipeline (OutputThread) and cancel_listening (hotkey thread)
+    concurrently. All methods are lock-protected.
+    """
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._pending_chars: int = 0
+        self._cancelled: bool = False
+        self._first_preview: bool = True
+
+    def add_chars(self, n: int):
+        with self._lock:
+            self._pending_chars += n
+
+    def consume_if_not_cancelled(self) -> tuple[int, bool]:
+        """Atomically consume pending chars if session was not cancelled.
+
+        Returns (chars, was_cancelled). If cancelled, resets the flag and
+        returns (0, True). Otherwise returns (pending_chars, False) and resets
+        pending_chars to 0.
+        """
+        with self._lock:
+            if self._cancelled:
+                self._cancelled = False
+                self._pending_chars = 0
+                return (0, True)
+            n = self._pending_chars
+            self._pending_chars = 0
+            return (n, False)
+
+    def cancel_and_consume(self) -> int:
+        """Called by cancel_listening. Returns chars to delete and sets cancelled flag."""
+        with self._lock:
+            n = self._pending_chars
+            self._pending_chars = 0
+            self._cancelled = True
+            return n
+
+    def take_first_preview(self) -> bool:
+        """Returns True the first time it is called per session, False thereafter."""
+        with self._lock:
+            if self._first_preview:
+                self._first_preview = False
+                return True
+            return False
+
+    def reset_cancel(self):
+        """Called at the start of a new listening session."""
+        with self._lock:
+            self._cancelled = False
+            self._pending_chars = 0
+            self._first_preview = True
+
+
+# ---------------------------------------------------------------------------
 # OutputPipeline thread
 # ---------------------------------------------------------------------------
 
 class OutputPipeline(threading.Thread):
-    """Reads flushed text from output_queue, structures it, then injects."""
+    """Reads flushed text from output_queue, structures it, then injects.
+
+    In streaming mode, the queue carries typed dicts:
+      {'type': 'preview', 'text': fragment}  — inject raw immediately
+      {'type': 'final',   'text': combined}  — replace previews with cleaned text
+
+    In non-streaming mode, the queue carries plain strings (existing behaviour).
+    """
 
     def __init__(
         self,
         input_queue: queue.Queue,
         structurer,
         injector,
+        streaming_state: StreamingState | None = None,
     ):
         super().__init__(name='OutputThread', daemon=True)
         self.input_queue = input_queue
         self.structurer = structurer
         self.injector = injector
+        self.streaming_state = streaming_state
         self._stop_event = threading.Event()
 
     def run(self):
         while not self._stop_event.is_set():
             try:
-                text = self.input_queue.get(timeout=0.1)
+                msg = self.input_queue.get(timeout=0.1)
             except queue.Empty:
                 continue
 
-            if text is None:  # Shutdown sentinel
+            if msg is None:  # Shutdown sentinel
                 break
 
             try:
-                logging.info(f"OutputPipeline: received text ({len(text.split())} words)")
-                cleaned = self.structurer.process(text)
-                logging.info(f"OutputPipeline: structured, injecting...")
-                self.injector.inject(cleaned)
-                logging.info(f"OutputPipeline: injection complete")
+                if isinstance(msg, dict):
+                    msg_type = msg.get('type')
+                    if msg_type == 'preview':
+                        self._handle_preview(msg['text'])
+                    elif msg_type == 'final':
+                        self._handle_final(msg['text'])
+                    else:
+                        logging.warning(f"OutputPipeline: unknown message type {msg_type!r}")
+                else:
+                    # Non-streaming: plain string
+                    logging.info(f"OutputPipeline: received text ({len(msg.split())} words)")
+                    cleaned = self.structurer.process(msg)
+                    logging.info("OutputPipeline: structured, injecting...")
+                    self.injector.inject(cleaned)
+                    logging.info("OutputPipeline: injection complete")
             except Exception as e:
                 logging.error(f"OutputPipeline crashed: {e}", exc_info=True)
+
+    def _handle_preview(self, text: str):
+        logging.debug(f"OutputPipeline: preview {text!r}")
+        # First preview of a session opens with ### to signal "still processing"
+        if self.streaming_state is not None and self.streaming_state.take_first_preview():
+            chars = self.injector.inject(text, prefix='### ')
+        else:
+            chars = self.injector.inject(text)
+        if self.streaming_state is not None:
+            self.streaming_state.add_chars(chars)
+
+    def _handle_final(self, text: str):
+        logging.info(f"OutputPipeline: final flush ({len(text.split())} words), structuring...")
+        cleaned = self.structurer.process(text)
+
+        if self.streaming_state is None:
+            self.injector.inject(cleaned)
+            return
+
+        chars_to_delete, was_cancelled = self.streaming_state.consume_if_not_cancelled()
+
+        if was_cancelled:
+            logging.info("OutputPipeline: session cancelled, discarding final flush")
+            return
+
+        if chars_to_delete > 0:
+            # Close the ### marker so the user sees ###preview### before replacement
+            close = self.injector._inject_raw('###')
+            chars_to_delete += close
+            logging.info(f"OutputPipeline: deleting {chars_to_delete} preview chars (incl. markers)")
+            self.injector.delete_chars(chars_to_delete)
+
+        logging.info("OutputPipeline: injecting cleaned text")
+        self.injector.inject(cleaned)
+        logging.info("OutputPipeline: final injection complete")
 
     def stop(self):
         self._stop_event.set()
@@ -124,11 +239,18 @@ class DictationSystem:
         from transcribe import TranscriptionWorker
         from vad import VADProcessor
 
+        streaming_enabled: bool = config.get('output', {}).get('streaming_preview', False)
+
         # Inter-thread queues (maxsize=50 provides backpressure)
         self._audio_queue: queue.Queue = queue.Queue(maxsize=50)
         self._speech_queue: queue.Queue = queue.Queue(maxsize=20)
         self._text_queue: queue.Queue = queue.Queue(maxsize=20)
         self._output_queue: queue.Queue = queue.Queue(maxsize=20)
+
+        # Streaming state (only used when streaming_preview is enabled)
+        self._streaming_state: StreamingState | None = (
+            StreamingState() if streaming_enabled else None
+        )
 
         # Workers
         self._audio = AudioCapture(config['audio'], self._audio_queue)
@@ -137,12 +259,14 @@ class DictationSystem:
             config['transcription'], self._speech_queue, self._text_queue
         )
         self._buffer = TranscriptionBuffer(
-            config['buffer'], self._text_queue, self._output_queue
+            config['buffer'], self._text_queue, self._output_queue,
+            streaming=streaming_enabled,
         )
         self._structurer = TextStructurer(config['structuring'])
         self._injector = OutputInjector(config['output'])
         self._output_pipeline = OutputPipeline(
-            self._output_queue, self._structurer, self._injector
+            self._output_queue, self._structurer, self._injector,
+            streaming_state=self._streaming_state,
         )
 
     # ------------------------------------------------------------------
@@ -200,6 +324,12 @@ class DictationSystem:
                 self._vad.reset()
                 # Clear the buffer without flushing to output
                 self._buffer._buffer.clear()
+                # Delete any preview chars already injected onto screen
+                if self._streaming_state is not None:
+                    chars = self._streaming_state.cancel_and_consume()
+                    if chars > 0:
+                        logging.info(f"cancel_listening: deleting {chars} preview chars")
+                        self._injector.delete_chars(chars)
 
     # ------------------------------------------------------------------
     # Internal
@@ -208,6 +338,11 @@ class DictationSystem:
     def _start_listening(self):
         self._listening = True
         self._vad.reset()
+        if self._streaming_state is not None:
+            self._streaming_state.reset_cancel()
+        else:
+            # Non-streaming: suppress the leading space so lines don't start with ' '
+            self._injector.suppress_leading_space()
         self._audio.start()
         logging.info("=== LISTENING ON ===  (press Ctrl+` to stop)")
         print("\n[LISTENING]", flush=True)

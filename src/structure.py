@@ -1,22 +1,118 @@
 """
-structure.py — Text cleanup via Ollama local LLM.
+structure.py — Text cleanup pipeline.
 
-TextStructurer is a synchronous callable (not a thread). It sends raw
-transcription text to a local Ollama instance and returns the cleaned result.
+Two-stage processing:
+  1. Deterministic Python formatting (always runs):
+       - Strip Whisper-generated punctuation
+       - Convert spoken punctuation words ("period", "comma", etc.) to symbols
+       - Fix spacing around punctuation
+       - Capitalize sentence starts
+  2. Optional Ollama LLM cleanup (runs when structuring.enabled = true)
 
-Failure modes are handled gracefully:
-  - Ollama not running → returns original text immediately
-  - Request timeout → returns original text, resets availability cache
-  - Empty response → returns original text with a warning
-
-Availability is checked once per session (cached). On timeout/error, the cache
-is reset so the next call re-checks, allowing recovery after Ollama restarts.
+Failure modes for Ollama are handled gracefully:
+  - Ollama not running → returns Python-formatted text immediately
+  - Request timeout → returns Python-formatted text, resets availability cache
+  - Empty response → returns Python-formatted text with a warning
 """
 
 import logging
+import re
+from collections import deque
 
 import requests
 
+
+# ---------------------------------------------------------------------------
+# Spoken punctuation conversion
+# Multi-word patterns must come before their component single-word patterns.
+# ---------------------------------------------------------------------------
+
+_SPOKEN_PUNCTUATION: list[tuple[re.Pattern, str]] = [
+    (re.compile(r'\bopen\s+quote\b', re.IGNORECASE),           '"'),
+    (re.compile(r'\b(?:close|end)\s+quote\b', re.IGNORECASE),  '"'),
+    (re.compile(r'\b(?:open|left)\s+paren(?:thesis)?\b', re.IGNORECASE),  '('),
+    (re.compile(r'\b(?:close|right)\s+paren(?:thesis)?\b', re.IGNORECASE), ')'),
+    (re.compile(r'\bquestion\s+mark\b', re.IGNORECASE),        '?'),
+    (re.compile(r'\bexclamation\s+(?:point|mark)\b', re.IGNORECASE), '!'),
+    (re.compile(r'\bnew\s+paragraph\b', re.IGNORECASE),        '\n\n'),
+    (re.compile(r'\bnew\s+line\b', re.IGNORECASE),             '\n'),
+    (re.compile(r'\bperiod\b', re.IGNORECASE),                 '.'),
+    (re.compile(r'\bcomma\b', re.IGNORECASE),                  ','),
+    (re.compile(r'\bcolon\b', re.IGNORECASE),                  ':'),
+    (re.compile(r'\bsemicolon\b', re.IGNORECASE),              ';'),
+    (re.compile(r'\bquote\b', re.IGNORECASE),                  '"'),
+    (re.compile(r'\bunquote\b', re.IGNORECASE),                '"'),
+    (re.compile(r'\bdash\b', re.IGNORECASE),                   ' — '),
+    (re.compile(r'\bellipsis\b', re.IGNORECASE),               '...'),
+]
+
+
+def _strip_whisper_punctuation(text: str) -> str:
+    """Remove Whisper-generated punctuation and lowercase everything.
+
+    Capitalisation is re-applied deterministically by _capitalize_sentences.
+    The only capital preserved mid-sentence is the pronoun 'I'.
+    Apostrophes inside words (contractions: don't, I'm) and hyphens inside
+    hyphenated words are preserved.
+    """
+    # Remove sentence-end marks and inline punctuation
+    text = re.sub(r'[.!?,;:]', ' ', text)
+    # Strip standalone quotes
+    text = re.sub(r'(?<!\w)["\u201c\u201d]|["\u201c\u201d](?!\w)', ' ', text)
+    # Lowercase everything, then restore the standalone pronoun 'I'
+    text = text.lower()
+    text = re.sub(r'\bi\b', 'I', text)
+    # Collapse whitespace
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def _apply_spoken_punctuation(text: str) -> str:
+    """Replace spoken punctuation words with their symbol equivalents."""
+    for pattern, symbol in _SPOKEN_PUNCTUATION:
+        text = pattern.sub(symbol, text)
+    return text
+
+
+def _fix_punctuation_spacing(text: str) -> str:
+    """Normalize whitespace around punctuation symbols."""
+    # No space before closing punctuation
+    text = re.sub(r'\s+([.!?,;:])', r'\1', text)
+    # No space after '(' and no space before ')'
+    text = re.sub(r'\(\s+', '(', text)
+    text = re.sub(r'\s+\)', ')', text)
+    # Ensure exactly one space after sentence-ending punctuation (not at end of string)
+    text = re.sub(r'([.!?])(?=[^\s\n])', r'\1 ', text)
+    # Collapse any double spaces
+    return re.sub(r'  +', ' ', text).strip()
+
+
+def _capitalize_sentences(text: str) -> str:
+    """Capitalize the first letter of the text and after each sentence-ending mark."""
+    if not text:
+        return text
+    # Capitalize very first character
+    text = text[0].upper() + text[1:]
+    # Capitalize the first letter following '. ', '! ', or '? '
+    text = re.sub(
+        r'([.!?]\s+)([a-z])',
+        lambda m: m.group(1) + m.group(2).upper(),
+        text,
+    )
+    return text
+
+
+def _python_format(text: str) -> str:
+    """Full deterministic formatting pipeline."""
+    text = _strip_whisper_punctuation(text)
+    text = _apply_spoken_punctuation(text)
+    text = _fix_punctuation_spacing(text)
+    text = _capitalize_sentences(text)
+    return text
+
+
+# ---------------------------------------------------------------------------
+# TextStructurer
+# ---------------------------------------------------------------------------
 
 class TextStructurer:
     def __init__(self, config: dict):
@@ -26,8 +122,10 @@ class TextStructurer:
         self.timeout: float = float(config.get('timeout_seconds', 10))
         self.prompt_template: str = config.get(
             'prompt_template',
-            'Clean up this speech transcription, fixing punctuation:\n{text}',
+            'Clean up this speech transcription, fixing punctuation:\n{context_section}{text}',
         )
+        context_window_size: int = config.get('context_window', 3)
+        self._context: deque[str] = deque(maxlen=context_window_size)
         # None = unchecked, True = available, False = unavailable
         self._available: bool | None = None
 
@@ -36,14 +134,20 @@ class TextStructurer:
     # ------------------------------------------------------------------
 
     def process(self, text: str) -> str:
-        """Return cleaned text, or the original if structuring is unavailable."""
-        if not self.enabled or not text.strip():
+        """Format and return cleaned text."""
+        if not text.strip():
             return text
 
-        if not self._check_availability():
+        # Stage 1: deterministic Python formatting (always runs)
+        text = _python_format(text)
+
+        # Stage 2: optional Ollama LLM cleanup
+        if not self.enabled or not self._check_availability():
             return text
 
-        return self._call_ollama(text)
+        cleaned = self._call_ollama(text)
+        self._context.append(cleaned)
+        return cleaned
 
     # ------------------------------------------------------------------
     # Internal
@@ -57,7 +161,6 @@ class TextStructurer:
         try:
             r = requests.get(f"{self.ollama_url}/api/tags", timeout=2.0)
             if r.status_code == 200:
-                # Verify the requested model is actually pulled
                 tags = r.json().get('models', [])
                 model_names = [m.get('name', '').split(':')[0] for m in tags]
                 if self.model not in model_names:
@@ -65,7 +168,6 @@ class TextStructurer:
                         f"Ollama is running but model '{self.model}' is not pulled. "
                         f"Run: ollama pull {self.model}"
                     )
-                    # Still mark as available — Ollama will return an error we handle
                 self._available = True
                 logging.info(f"Ollama available at {self.ollama_url}")
             else:
@@ -81,14 +183,23 @@ class TextStructurer:
         return self._available
 
     def _call_ollama(self, text: str) -> str:
-        prompt = self.prompt_template.format(text=text)
+        if self._context:
+            context_section = (
+                'Recent context (already cleaned — use for grammatical understanding only, '
+                'do not repeat in output):\n'
+                + '\n'.join(self._context)
+                + '\n\n'
+            )
+        else:
+            context_section = ''
+        prompt = self.prompt_template.format(text=text, context_section=context_section)
 
         payload = {
             'model': self.model,
             'prompt': prompt,
             'stream': False,
             'options': {
-                'temperature': 0.1,   # Low temperature for deterministic cleanup
+                'temperature': 0.1,
                 'num_predict': 512,
             },
         }
@@ -114,7 +225,7 @@ class TextStructurer:
                 f"Ollama timeout ({self.timeout}s) — using raw text. "
                 "Will retry on next flush."
             )
-            self._available = None  # Reset so we re-check next time
+            self._available = None
             return text
 
         except requests.exceptions.HTTPError as e:

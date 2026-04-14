@@ -26,10 +26,12 @@ class TranscriptionBuffer(threading.Thread):
         config: dict,
         input_queue: queue.Queue,
         output_queue: queue.Queue,
+        streaming: bool = False,
     ):
         super().__init__(name='BufferThread', daemon=True)
         self.input_queue = input_queue
         self.output_queue = output_queue
+        self._streaming = streaming
         self._stop_event = threading.Event()
         self._flush_event = threading.Event()
 
@@ -65,6 +67,13 @@ class TranscriptionBuffer(threading.Thread):
                     self._buffer.append(text)
                     self._last_input_time = time.monotonic()
                     word_count = sum(len(t.split()) for t in self._buffer)
+
+                # Emit preview immediately (outside lock — put() can block)
+                if self._streaming:
+                    try:
+                        self.output_queue.put({'type': 'preview', 'text': text}, timeout=2.0)
+                    except queue.Full:
+                        logging.warning("Buffer: output_queue full, dropping preview")
 
                 # Flush on word limit
                 if word_count >= self.max_words:
@@ -116,6 +125,7 @@ class TranscriptionBuffer(threading.Thread):
         logging.info(f"Buffer flush ({reason}): {word_count} words → sending to output")
 
         try:
-            self.output_queue.put(combined, timeout=2.0)
+            msg = {'type': 'final', 'text': combined} if self._streaming else combined
+            self.output_queue.put(msg, timeout=2.0)
         except queue.Full:
             logging.warning("Buffer: output_queue full, dropping flush")

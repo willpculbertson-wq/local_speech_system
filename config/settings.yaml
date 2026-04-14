@@ -24,23 +24,27 @@ buffer:
   sentence_end_chars: []
 
 structuring:
-  enabled: true
+  enabled: false
   ollama_url: http://localhost:11434
   model: mistral            # must be pulled first: ollama pull mistral
   timeout_seconds: 10
+  context_window: 3         # number of recent cleaned sentences to pass as context
   prompt_template: |
-    You are a transcription cleanup assistant. Fix punctuation, capitalization, and
-    sentence boundaries in the following raw speech transcription. Remove filler words
-    (um, uh, like, you know). Preserve the original meaning exactly — do not rephrase
-    or add information. Return ONLY the cleaned text with no commentary, no explanation,
-    and no quotation marks around the output.
-
+    Clean the raw speech transcription below. Make only these changes:
+    - Fix capitalization (capitalize the first word of each sentence)
+    - Fix end-of-sentence punctuation (. ! ?)
+    - Ensure a space follows each period, exclamation mark, or question mark
+    - Remove only: "um", "uh"
+    - Do not rephrase, restructure, reorder, or add any words
+    - Return ONLY the cleaned text with no commentary and no quotation marks
+    {context_section}
     Raw transcription:
     {text}
 
 output:
-  method: clipboard         # clipboard (recommended) or direct_keyboard
-  paste_delay_ms: 100
+  method: sendinput         # sendinput (recommended), clipboard, or direct_keyboard
+  paste_delay_ms: 100       # only used when method: clipboard
+  streaming_preview: true  # set true to inject raw text immediately, then replace with cleaned version
 
 hotkey:
   toggle: ctrl+`
