@@ -48,19 +48,23 @@ _SPOKEN_PUNCTUATION: list[tuple[re.Pattern, str]] = [
 
 
 def _strip_whisper_punctuation(text: str) -> str:
-    """Remove Whisper-generated punctuation and lowercase everything.
+    """Remove Whisper-generated punctuation and normalise initial casing.
 
-    Capitalisation is re-applied deterministically by _capitalize_sentences.
-    The only capital preserved mid-sentence is the pronoun 'I'.
-    Apostrophes inside words (contractions: don't, I'm) and hyphens inside
-    hyphenated words are preserved.
+    Only the *first* character is lowercased, neutralising Whisper's habit of
+    capitalising the start of every output.  The rest of the string is left
+    as-is so that acronyms (NATO, USA, …) already correctly capitalised by
+    Whisper are preserved.  Final capitalisation of the first word is handled
+    by OutputInjector.inject() based on cursor context.
+    The standalone pronoun 'I' is restored throughout.
     """
     # Remove sentence-end marks and inline punctuation
     text = re.sub(r'[.!?,;:]', ' ', text)
     # Strip standalone quotes
     text = re.sub(r'(?<!\w)["\u201c\u201d]|["\u201c\u201d](?!\w)', ' ', text)
-    # Lowercase everything, then restore the standalone pronoun 'I'
-    text = text.lower()
+    # Lowercase only the first character so inject() controls sentence-start cap
+    if text:
+        text = text[0].lower() + text[1:]
+    # Restore the standalone pronoun 'I'
     text = re.sub(r'\bi\b', 'I', text)
     # Collapse whitespace
     return re.sub(r'\s+', ' ', text).strip()
