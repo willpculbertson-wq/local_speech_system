@@ -75,55 +75,58 @@ def _capitalize_first(text: str) -> str:
 
 
 def _get_injection_prefix(chars: str | None, body: str) -> str:
-    """Return the full string to inject: leading space/cap + body.
+    """Return the full string to inject: body (capitalised as needed) + trailing space.
+
+    Every injection ends with a trailing space so the cursor lands after it;
+    the next injection can then begin without a leading space.  No leading
+    space is ever added — the gap comes from the previous injection's trailer.
 
     chars: up to 2 characters immediately before the cursor (UIAutomation),
            or a single tracked character, or None.
     body:  stripped text to inject.
 
-    Grammatical rules applied in priority order:
-      1. Body starts with punctuation → attach directly (no space, no cap).
-      2. No context (None / empty) → capitalise, no space (start of doc).
+    Capitalisation rules (applied in priority order):
+      1. Body starts with punctuation → attach directly, no cap.
+      2. No context (None / empty) → capitalise (start of doc / unknown).
       3. Cursor after space:
            - preceded by .!? or newline or bullet (•*) → capitalise
            - preceded by anything else (letter, -:;—…,) → no cap
-         Either way: no additional space (one is already there).
-      4. Cursor after newline → capitalise, no space.
-      5. Cursor right after .!? (no space yet) → space + capitalise.
-      6. Cursor after continuation punctuation (,:;-—…) → space, no cap.
-      7. Cursor after any other character → space, no cap.
+      4. Cursor after newline → capitalise.
+      5. Cursor right after .!? → capitalise.
+      6. Cursor after continuation punctuation (,:;-—…) → no cap.
+      7. Cursor after any other character → no cap.
     """
-    # Rule 1 — punctuation body
+    # Rule 1 — punctuation body: attach directly
     if body[0] in '.!?,;:)':
-        return body
+        return body + ' '
 
     # Rule 2 — unknown / start of document
     if not chars:
-        return _capitalize_first(body)
+        return _capitalize_first(body) + ' '
 
     last = chars[-1]                              # char immediately left of cursor
     prev = chars[-2] if len(chars) >= 2 else ''  # char before that
 
-    # Rule 3 — cursor is after a space
+    # Rule 3 — cursor is after a space (typically from a previous trailing space)
     if last in ' \t':
         if prev in '.!?' or prev in '\n\r' or prev in '•*':
-            return _capitalize_first(body)        # new sentence / after bullet
-        return body                               # mid-sentence continuation
+            return _capitalize_first(body) + ' '  # new sentence / after bullet
+        return body + ' '                          # mid-sentence continuation
 
     # Rule 4 — cursor after newline (new paragraph / line)
     if last in '\n\r':
-        return _capitalize_first(body)
+        return _capitalize_first(body) + ' '
 
-    # Rule 5 — cursor right after sentence-ending punctuation (no space yet)
+    # Rule 5 — cursor right after sentence-ending punctuation
     if last in '.!?':
-        return ' ' + _capitalize_first(body)
+        return _capitalize_first(body) + ' '
 
     # Rule 6 — continuation punctuation (comma, colon, semicolon, dash, em-dash, ellipsis)
     if last in ',:;-—…':
-        return ' ' + body
+        return body + ' '
 
     # Rule 7 — regular character (letter, digit, quote, paren, etc.)
-    return ' ' + body
+    return body + ' '
 
 
 class OutputInjector:
@@ -134,6 +137,11 @@ class OutputInjector:
         # Last character we injected — drives context-aware spacing/capitalisation.
         # None means "unknown / start of document".
         self._last_injected_char: str | None = None
+        # When True, inject() skips the UIAutomation re-read once and uses
+        # _last_injected_char directly. Set by set_last_char() so that an
+        # explicit context restore (e.g. after deleting indicator chars) is not
+        # immediately overwritten by a stale UIAutomation read.
+        self._skip_uia_once: bool = False
 
     # ------------------------------------------------------------------
     # Public API
@@ -146,8 +154,13 @@ class OutputInjector:
         — e.g. after deleting preview chars in streaming mode, the cursor has
         moved back and the preceding character is whatever was there before the
         preview started.
+
+        Also sets _skip_uia_once so the next inject() uses this value directly
+        rather than re-reading UIAutomation (which may not yet have processed
+        the preceding delete_chars() call).
         """
         self._last_injected_char = char
+        self._skip_uia_once = True
 
     def inject(self, text: str, prefix: str | None = None) -> int:
         """Inject text into the active window with context-aware spacing/capitalisation.
@@ -171,21 +184,49 @@ class OutputInjector:
         if prefix is not None:
             # Explicit prefix — caller controls spacing and capitalisation entirely
             final = prefix + body
+        elif body[0] in '.!?,;:)':
+            # Punctuation body: delete any trailing space left by the previous
+            # injection so the punctuation attaches directly to the preceding word.
+            if self._skip_uia_once:
+                self._skip_uia_once = False
+                # _last_injected_char holds the content char; if it is set, the
+                # previous inject() added a trailing space that's still on screen.
+                has_trailing_space = self._last_injected_char is not None
+            else:
+                ctx1 = get_preceding_chars(1)
+                if ctx1 is not None:
+                    has_trailing_space = ctx1[-1] == ' '
+                else:
+                    has_trailing_space = self._last_injected_char is not None
+            if has_trailing_space:
+                self.delete_chars(1)
+            final = body + ' '
         else:
-            # Refresh cursor context from UIAutomation right before injecting.
-            # By inject() time the text editor is reliably focused (audio capture
-            # and transcription take 1-5 s), so this read is accurate regardless
-            # of where the user navigated since the last session.
-            # Falls back silently to tracked _last_injected_char on any failure.
-            ctx = get_preceding_chars(2)
-            if ctx is not None:
-                self._last_injected_char = ctx[-1]
-            chars_for_logic = ctx if ctx is not None else self._last_injected_char
+            if self._skip_uia_once:
+                # A set_last_char() call explicitly restored context (e.g. after
+                # deleting indicator chars). Trust that value — don't re-read
+                # UIAutomation, which may not yet have seen the preceding deletes.
+                self._skip_uia_once = False
+                chars_for_logic = self._last_injected_char
+            else:
+                # Refresh cursor context from UIAutomation right before injecting.
+                # By inject() time the text editor is reliably focused (audio capture
+                # and transcription take 1-5 s), so this read is accurate regardless
+                # of where the user navigated since the last session.
+                # Falls back silently to tracked _last_injected_char on any failure.
+                ctx = get_preceding_chars(2)
+                if ctx is not None:
+                    self._last_injected_char = ctx[-1]
+                chars_for_logic = ctx if ctx is not None else self._last_injected_char
             final = _get_injection_prefix(chars_for_logic, body)
 
         self._send(final)
         if final:
-            self._last_injected_char = final[-1]
+            # Store the last *content* character (before the trailing space) so
+            # that _skip_uia_once correctly drives capitalisation on the next
+            # inject() without needing a UIAutomation read.
+            # e.g. final = "sentence. " → store '.' so next inject capitalises.
+            self._last_injected_char = final[-2] if len(final) >= 2 else final[-1]
         return len(final)
 
     def _inject_raw(self, text: str) -> int:

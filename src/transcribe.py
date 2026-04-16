@@ -37,7 +37,6 @@ _HALLUCINATIONS = frozenset({
     'have a good one!',
     'thanks for watching.',
     'thanks for watching!',
-    'you',
     '.',
     '',
 })

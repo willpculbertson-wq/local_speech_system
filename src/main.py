@@ -199,6 +199,10 @@ class OutputPipeline(threading.Thread):
                         self._handle_preview(msg['text'])
                     elif msg_type == 'final':
                         self._handle_final(msg['text'])
+                    elif msg_type == 'session_end':
+                        # Session toggled off. Clear indicator only — no injection.
+                        # This runs on OutputThread so it can't race with inject().
+                        self._clear_indicator()
                     else:
                         logging.warning(f"OutputPipeline: unknown message type {msg_type!r}")
                 else:
@@ -225,10 +229,12 @@ class OutputPipeline(threading.Thread):
             logging.debug(f"OutputPipeline: cleared {chars} indicator chars")
 
     def _restart_dots(self):
-        """Start stacking dots after a successful injection (still listening).
-        Skipped if _stop_listening() has already cleared the restart flag."""
+        """Re-inject '<listening>' synchronously after a successful injection.
+        Skipped if _stop_listening() has already cleared the restart flag.
+        Runs on OutputThread so the self-clean (if stop() raced) completes
+        before the next queue message is processed."""
         if self.indicator is not None and self._restart_indicator_after_inject:
-            self.indicator.start_dots()
+            self.indicator.start_listening_sync()
 
     def _handle_preview(self, text: str):
         self._clear_indicator()
@@ -284,7 +290,7 @@ class OutputPipeline(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class DictationSystem:
-    def __init__(self, config: dict):
+    def __init__(self, config: dict, debug: bool = False):
         self.config = config
         self._listening = False
         self._lock = threading.Lock()
@@ -300,7 +306,7 @@ class DictationSystem:
         from vad import VADProcessor
 
         streaming_enabled: bool = config.get('output', {}).get('streaming_preview', False)
-        indicator_enabled: bool = config.get('output', {}).get('typing_indicator', True)
+        indicator_enabled: bool = debug and config.get('output', {}).get('typing_indicator', True)
 
         # Inter-thread queues (maxsize=50 provides backpressure)
         self._audio_queue: queue.Queue = queue.Queue(maxsize=50)
@@ -425,20 +431,18 @@ class DictationSystem:
         self._listening = False
         self._audio.stop()
         self._vad.reset()
-        # Prevent OutputPipeline from restarting dots after the final flush.
-        # Must be set before flush_now() so that any _handle_final that fires
-        # during the flush sees the flag as False.
+        # Prevent OutputPipeline from restarting indicator after the final flush.
         self._output_pipeline._restart_indicator_after_inject = False
-        # Clear indicator now — covers the empty-buffer case where _handle_final
-        # never fires (buffer was empty). If buffer is non-empty, OutputPipeline
-        # also calls _clear_indicator() before injecting (idempotent, no-op).
+        # Mark indicator inactive so _tick_listening / start_listening_sync won't
+        # add new chars after this point.  Do NOT delete here — deletion must
+        # happen on OutputThread to avoid racing with a concurrent inject().
         if self._indicator is not None:
-            chars, pre_char = self._indicator.stop()
-            if chars > 0:
-                self._injector.delete_chars(chars)
-                self._injector.set_last_char(pre_char)
-        # Flush any accumulated text in the buffer
+            self._indicator.stop()
+        # Flush any accumulated text in the buffer.
         self._buffer.flush_now()
+        # Post a session_end sentinel so OutputThread cleans up the indicator
+        # (handles both the non-empty-buffer case and the empty-buffer case).
+        self._output_queue.put({'type': 'session_end'})
         logging.info("=== LISTENING OFF ===")
         print("[STOPPED]", flush=True)
 
@@ -473,7 +477,7 @@ def main():
     pyautogui.PAUSE = 0
     pyautogui.FAILSAFE = False  # Disable move-to-corner failsafe for headless use
 
-    system = DictationSystem(config)
+    system = DictationSystem(config, debug=args.debug)
     system.start()
 
     # Register global hotkeys

@@ -7,6 +7,6 @@ taskkill /F /FI "WINDOWTITLE eq Dictation System" /FI "IMAGENAME eq python.exe" 
 :: Activate conda dictation env and run
 call C:\Users\willp\miniconda3\Scripts\activate.bat dictation
 cd /d "%~dp0"
-python src\main.py --debug
+python src\main.py
 
 pause

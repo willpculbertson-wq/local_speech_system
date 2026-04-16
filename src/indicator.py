@@ -1,18 +1,22 @@
 """
 indicator.py — Visual feedback injected into the active text window.
 
-Two indicator modes, used at different points in the dictation lifecycle:
+  start_listening()       →  injects '<listening>' after a short focus-return
+                              delay (150 ms).  Used at session start, called
+                              from the hotkey thread where the editor may not
+                              have focus yet.
 
-  start_listening()  →  injects '<listening>' when the user toggles on.
-                         Tells the user the system is armed and waiting.
+  start_listening_sync()  →  injects '<listening>' synchronously on the
+                              calling thread (no timer, no delay).  Used by
+                              OutputThread after each text injection; the editor
+                              is already focused and we need the injection to
+                              complete — and any stop()-race self-clean to run —
+                              before the next queue message is processed.
 
-  start_dots()       →  injects stacking middle dots (·) after each text
-                         injection to show the system is still listening.
-                         One dot per second, up to MAX_DOTS, then holds.
-
-Both modes share the same stop() / cleanup path: stop() cancels any pending
-timer, returns (chars_to_delete, pre_indicator_last_char) so the caller can
-delete the injected chars and restore the injector's context.
+  stop()                  →  cancels any pending timer, returns
+                              (chars_to_delete, pre_indicator_last_char) so the
+                              caller can delete the injected chars and restore
+                              the injector's context.
 
 stop() is idempotent — safe to call even if the indicator is not active.
 """
@@ -23,10 +27,7 @@ import threading
 
 class TypingIndicator:
     LISTENING_TEXT = '<listening>'
-    DOT_CHAR       = '\u00B7'   # · middle dot
-    MAX_DOTS       = 5
-    TICK_INTERVAL  = 1.0        # seconds between dots (also delay before first dot)
-    STARTUP_DELAY  = 0.15       # seconds to wait for focus to return after hotkey
+    STARTUP_DELAY  = 0.15   # seconds to wait for focus to return after hotkey
 
     def __init__(self, injector):
         self._injector = injector
@@ -34,7 +35,6 @@ class TypingIndicator:
         self._active = False
         self._timer: threading.Timer | None = None
         self._injected_chars: int = 0
-        self._dot_count: int = 0
         self._pre_indicator_last_char: str | None = None
 
     # ------------------------------------------------------------------
@@ -42,20 +42,40 @@ class TypingIndicator:
     # ------------------------------------------------------------------
 
     def start_listening(self):
-        """Inject '<listening>' after startup delay. Call from _start_listening().
+        """Inject '<listening>' after STARTUP_DELAY (150 ms).
 
-        The startup delay (150 ms) lets focus return to the text editor after
-        the hotkey press before we try to inject anything.
+        Use at session start from the hotkey thread where focus may not yet
+        have returned to the editor.
         """
-        self._begin(self.STARTUP_DELAY, dots_mode=False)
+        self._begin(self.STARTUP_DELAY)
 
-    def start_dots(self):
-        """Start stacking dots. Call after each successful text injection.
+    def start_listening_sync(self):
+        """Inject '<listening>' synchronously on the calling thread.
 
-        First dot appears after TICK_INTERVAL (1 s) so the user can read
-        the injected text before the indicator reappears.
+        Use from OutputThread after each text injection.  Because this runs
+        inline (no timer), any stop()-race self-clean completes before the
+        thread dequeues the next message — preventing self-clean from firing
+        after real text has already been appended to the cursor position.
         """
-        self._begin(self.TICK_INTERVAL, dots_mode=True)
+        with self._lock:
+            self._active = True
+            self._pre_indicator_last_char = self._injector._last_injected_char
+            self._injected_chars = 0
+
+        n = self._injector._inject_raw(self.LISTENING_TEXT)
+        logging.debug(f"TypingIndicator: injected '{self.LISTENING_TEXT}' (sync)")
+
+        with self._lock:
+            if not self._active:
+                # stop() was called while we were injecting.  The text is on
+                # screen but stop() returned (0, pre), so the caller won't
+                # erase it.  Self-clean now — this runs before the next queue
+                # message is processed because we're on the same thread.
+                if n > 0:
+                    self._injector.delete_chars(n)
+                    self._injector._last_injected_char = self._pre_indicator_last_char
+                return
+            self._injected_chars = n
 
     def stop(self) -> tuple[int, str | None]:
         """Stop the indicator. Returns (chars_to_delete, pre_indicator_last_char).
@@ -79,15 +99,12 @@ class TypingIndicator:
     # Internal
     # ------------------------------------------------------------------
 
-    def _begin(self, initial_delay: float, dots_mode: bool):
-        """Shared startup for both modes."""
+    def _begin(self, initial_delay: float):
         with self._lock:
             self._active = True
             self._injected_chars = 0
-            self._dot_count = 0
             self._pre_indicator_last_char = self._injector._last_injected_char
-        fn = self._tick_dots if dots_mode else self._tick_listening
-        self._schedule(initial_delay, fn)
+        self._schedule(initial_delay, self._tick_listening)
 
     def _schedule(self, delay: float, fn):
         t = threading.Timer(delay, fn)
@@ -104,40 +121,19 @@ class TypingIndicator:
         with self._lock:
             if not self._active:
                 return
-            self._injected_chars += len(self.LISTENING_TEXT)
 
+        # Inject outside the lock so stop() is never blocked by a slow send.
         n = self._injector._inject_raw(self.LISTENING_TEXT)
         logging.debug(f"TypingIndicator: injected '{self.LISTENING_TEXT}'")
 
-        # Correct the count if injection returned fewer chars than expected.
-        if n != len(self.LISTENING_TEXT):
-            with self._lock:
-                self._injected_chars = n
-
-        # No rescheduling — one-shot mode.
-
-    def _tick_dots(self):
-        """Repeating: inject one dot per tick until MAX_DOTS is reached."""
         with self._lock:
-            if not self._active or self._dot_count >= self.MAX_DOTS:
+            if not self._active:
+                # stop() was called while we were injecting — the text is on
+                # screen but stop() already returned (0, pre) so the caller
+                # won't erase it.  Clean it up now.
+                if n > 0:
+                    self._injector.delete_chars(n)
+                    self._injector._last_injected_char = self._pre_indicator_last_char
                 return
-            self._dot_count += 1
-            # Pre-reserve slot so stop() sees the correct count even if it
-            # races with the _inject_raw call below.
-            self._injected_chars += 1
-
-        n = self._injector._inject_raw(self.DOT_CHAR)
-        logging.debug(f"TypingIndicator: dot {self._dot_count}/{self.MAX_DOTS}")
-
-        if n == 0:
-            with self._lock:
-                self._injected_chars = max(0, self._injected_chars - 1)
-
-        # Decide whether to reschedule — must read flag while holding lock,
-        # then call _schedule() OUTSIDE the lock (_schedule also acquires it,
-        # so calling it while holding would deadlock on Python's non-reentrant Lock).
-        with self._lock:
-            schedule_next = self._active and self._dot_count < self.MAX_DOTS
-
-        if schedule_next:
-            self._schedule(self.TICK_INTERVAL, self._tick_dots)
+            # Still active — record the count so stop() knows what to erase.
+            self._injected_chars = n
