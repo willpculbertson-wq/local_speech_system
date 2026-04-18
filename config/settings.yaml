@@ -50,3 +50,13 @@ output:
 hotkey:
   toggle: ctrl+`
   cancel: escape
+
+overlay:
+  enabled: true
+  position: top-third         # top-center | top-third | top-left | top-right | bottom-right | bottom-left
+  offset_px: [0, 0]           # x/y offset from anchor position in pixels
+  fade_duration_ms: 1500      # fade-out duration when returning to idle
+  opacity: 0.70               # overlay opacity while visible (0.0–1.0)
+
+app:
+  run_at_login: false         # informational only; registry is authoritative

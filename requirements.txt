@@ -31,3 +31,6 @@ pyyaml>=6.0.1
 
 # --- Ollama HTTP client ---
 requests>=2.31.0
+
+# --- Qt GUI (system tray + overlay window) ---
+PyQt6>=6.6.0

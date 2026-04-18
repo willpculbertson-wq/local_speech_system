@@ -44,8 +44,9 @@ from cursor_context import get_preceding_chars
 _INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
-_VK_BACK = 0x08
+_VK_BACK   = 0x08
 _VK_RETURN = 0x0D
+_VK_SHIFT  = 0x10
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -176,10 +177,14 @@ class OutputInjector:
 
         Returns the number of characters injected.
         """
-        if not text.strip():
+        body = text.strip(' \t')
+        if not body:
             return 0
 
-        body = text.strip()
+        # Pure newline body (e.g. \r from "new line" voice command): inject directly,
+        # bypassing all spacing/capitalisation logic.
+        if all(c in '\r\n' for c in body):
+            return self._inject_raw(body)
 
         if prefix is not None:
             # Explicit prefix — caller controls spacing and capitalisation entirely
@@ -277,42 +282,41 @@ class OutputInjector:
         # Newlines are sent as VK_RETURN so they work across apps.
         # Characters outside the Basic Multilingual Plane are skipped
         # (surrogate pairs would need 4 events; rare in dictation output).
-        events: list[tuple[str, int]] = []
+        # Build flat list of (type, value, flags) triples — one per SendInput event.
+        # \n  → bare Enter (2 events)
+        # \r  → Shift+Enter (4 events: shift-dn, enter-dn, enter-up, shift-up)
+        # other BMP chars → Unicode key pair (2 events)
+        raw: list[tuple[int, int, int]] = []  # (type=INPUT_KEYBOARD, wVk_or_wScan, dwFlags)
         for ch in text:
             cp = ord(ch)
             if ch == '\n':
-                events.append(('vk', _VK_RETURN))
+                raw.append((_VK_RETURN, 0, 0))
+                raw.append((_VK_RETURN, 0, _KEYEVENTF_KEYUP))
+            elif ch == '\r':
+                raw.append((_VK_SHIFT, 0, 0))
+                raw.append((_VK_RETURN, 0, 0))
+                raw.append((_VK_RETURN, 0, _KEYEVENTF_KEYUP))
+                raw.append((_VK_SHIFT, 0, _KEYEVENTF_KEYUP))
             elif cp <= 0xFFFF:
-                events.append(('uni', cp))
+                raw.append((0, cp, _KEYEVENTF_UNICODE))
+                raw.append((0, cp, _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP))
             # else: skip non-BMP character
 
-        n = len(events)
+        n = len(raw)
         if n == 0:
             return
 
-        inputs = (_INPUT * (2 * n))()
-        for i, (kind, value) in enumerate(events):
-            if kind == 'vk':
-                inputs[2 * i].type = _INPUT_KEYBOARD
-                inputs[2 * i].ki.wVk = value
-                inputs[2 * i].ki.dwFlags = 0
-                inputs[2 * i + 1].type = _INPUT_KEYBOARD
-                inputs[2 * i + 1].ki.wVk = value
-                inputs[2 * i + 1].ki.dwFlags = _KEYEVENTF_KEYUP
-            else:
-                inputs[2 * i].type = _INPUT_KEYBOARD
-                inputs[2 * i].ki.wVk = 0
-                inputs[2 * i].ki.wScan = value
-                inputs[2 * i].ki.dwFlags = _KEYEVENTF_UNICODE
-                inputs[2 * i + 1].type = _INPUT_KEYBOARD
-                inputs[2 * i + 1].ki.wVk = 0
-                inputs[2 * i + 1].ki.wScan = value
-                inputs[2 * i + 1].ki.dwFlags = _KEYEVENTF_UNICODE | _KEYEVENTF_KEYUP
+        inputs = (_INPUT * n)()
+        for i, (vk, scan, flags) in enumerate(raw):
+            inputs[i].type = _INPUT_KEYBOARD
+            inputs[i].ki.wVk = vk
+            inputs[i].ki.wScan = scan
+            inputs[i].ki.dwFlags = flags
 
         with self._lock:
-            sent = _SendInput(2 * n, inputs, _INPUT_SIZE)
-            if sent != 2 * n:
-                logging.warning(f"inject: SendInput sent {sent}/{2 * n} events")
+            sent = _SendInput(n, inputs, _INPUT_SIZE)
+            if sent != n:
+                logging.warning(f"inject: SendInput sent {sent}/{n} events")
             else:
                 logging.info(f"Injected {len(text)} chars via SendInput Unicode")
 

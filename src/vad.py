@@ -48,6 +48,7 @@ class VADProcessor(threading.Thread):
         self._stop_event = threading.Event()
         self._model = None
         self._iterator = None
+        self.on_speech_detected = None  # Callable[[], None] | None
 
     # ------------------------------------------------------------------
     # Thread lifecycle
@@ -81,6 +82,8 @@ class VADProcessor(threading.Thread):
                 if 'start' in speech_dict:
                     in_speech = True
                     speech_buffer = []
+                    if self.on_speech_detected:
+                        self.on_speech_detected()
 
                 if in_speech:
                     speech_buffer.append(chunk)

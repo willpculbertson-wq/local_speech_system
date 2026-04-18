@@ -32,6 +32,11 @@ from pathlib import Path
 import pyautogui
 import yaml
 
+from PyQt6.QtCore import QTimer
+from PyQt6.QtWidgets import QApplication
+
+from signals import DictationSignals
+
 
 # ---------------------------------------------------------------------------
 # Config loading
@@ -181,6 +186,11 @@ class OutputPipeline(threading.Thread):
         # does not fire after the final flush once the user has toggled off.
         self._restart_indicator_after_inject: bool = False
         self._stop_event = threading.Event()
+        # Optional callbacks wired by DictationSystem after construction.
+        # Called from OutputThread — Qt delivers them on the main thread.
+        self.on_processing_start: 'Callable[[], None] | None' = None
+        self.on_session_complete: 'Callable[[], None] | None' = None
+        self.on_injection_complete: 'Callable[[], None] | None' = None
 
     def run(self):
         while not self._stop_event.is_set():
@@ -203,6 +213,8 @@ class OutputPipeline(threading.Thread):
                         # Session toggled off. Clear indicator only — no injection.
                         # This runs on OutputThread so it can't race with inject().
                         self._clear_indicator()
+                        if self.on_session_complete:
+                            self.on_session_complete()
                     else:
                         logging.warning(f"OutputPipeline: unknown message type {msg_type!r}")
                 else:
@@ -214,6 +226,8 @@ class OutputPipeline(threading.Thread):
                     self.injector.inject(cleaned)
                     logging.info("OutputPipeline: injection complete")
                     self._restart_dots()
+                    if self.on_injection_complete:
+                        self.on_injection_complete()
             except Exception as e:
                 logging.error(f"OutputPipeline crashed: {e}", exc_info=True)
 
@@ -238,6 +252,8 @@ class OutputPipeline(threading.Thread):
 
     def _handle_preview(self, text: str):
         self._clear_indicator()
+        if self.on_processing_start:
+            self.on_processing_start()
         logging.debug(f"OutputPipeline: preview {text!r}")
         if self.streaming_state is not None and self.streaming_state.take_first_preview():
             # Open with ### to signal "still processing".
@@ -290,8 +306,9 @@ class OutputPipeline(threading.Thread):
 # ---------------------------------------------------------------------------
 
 class DictationSystem:
-    def __init__(self, config: dict, debug: bool = False):
+    def __init__(self, config: dict, debug: bool = False, signals: DictationSignals | None = None):
         self.config = config
+        self._signals = signals
         self._listening = False
         self._lock = threading.Lock()
         self._shutdown_event = threading.Event()
@@ -339,6 +356,11 @@ class DictationSystem:
             streaming_state=self._streaming_state,
             indicator=self._indicator,
         )
+        if signals is not None:
+            self._vad.on_speech_detected = lambda: signals.state_changed.emit('processing')
+            self._output_pipeline.on_processing_start = lambda: signals.state_changed.emit('processing')
+            self._output_pipeline.on_injection_complete = lambda: signals.state_changed.emit('listening') if self._listening else None
+            self._output_pipeline.on_session_complete = lambda: signals.state_changed.emit('idle')
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -353,6 +375,8 @@ class DictationSystem:
         logging.info("All pipeline workers started")
 
     def shutdown(self):
+        if self._shutdown_event.is_set():
+            return
         logging.info("Shutting down...")
         if self._listening:
             self._stop_listening()
@@ -409,6 +433,8 @@ class DictationSystem:
                     if chars > 0:
                         logging.info(f"cancel_listening: deleting {chars} preview chars")
                         self._injector.delete_chars(chars)
+                if self._signals is not None:
+                    self._signals.state_changed.emit('idle')
 
     # ------------------------------------------------------------------
     # Internal
@@ -424,6 +450,8 @@ class DictationSystem:
         self._output_pipeline._restart_indicator_after_inject = True
         if self._indicator is not None:
             self._indicator.start_listening()
+        if self._signals is not None:
+            self._signals.state_changed.emit('listening')
         logging.info("=== LISTENING ON ===  (press Ctrl+` to stop)")
         print("\n[LISTENING]", flush=True)
 
@@ -443,6 +471,8 @@ class DictationSystem:
         # Post a session_end sentinel so OutputThread cleans up the indicator
         # (handles both the non-empty-buffer case and the empty-buffer case).
         self._output_queue.put({'type': 'session_end'})
+        if self._signals is not None:
+            self._signals.state_changed.emit('idle')
         logging.info("=== LISTENING OFF ===")
         print("[STOPPED]", flush=True)
 
@@ -477,42 +507,60 @@ def main():
     pyautogui.PAUSE = 0
     pyautogui.FAILSAFE = False  # Disable move-to-corner failsafe for headless use
 
-    system = DictationSystem(config, debug=args.debug)
-    system.start()
+    app = QApplication(sys.argv)
+    app.setQuitOnLastWindowClosed(False)  # no windows — tray icon keeps us alive
 
-    # Register global hotkeys
+    signals = DictationSignals()
+    system = DictationSystem(config, debug=args.debug, signals=signals)
+
+    app.aboutToQuit.connect(system.shutdown)
+
+    def _handle_signal(sig, frame):
+        print("\nShutting down...", flush=True)
+        app.quit()
+
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
+
     import keyboard
 
     hotkey_cfg = config.get('hotkey', {})
     toggle_key: str = hotkey_cfg.get('toggle', 'ctrl+`')
     cancel_key: str = hotkey_cfg.get('cancel', 'escape')
 
-    keyboard.add_hotkey(toggle_key, system.toggle_listening, suppress=True)
-    keyboard.add_hotkey(cancel_key, system.cancel_listening, suppress=False)
+    def _deferred_startup():
+        system.start()
+        keyboard.add_hotkey(toggle_key, system.toggle_listening, suppress=True)
+        keyboard.add_hotkey(cancel_key, system.cancel_listening, suppress=False)
 
-    logging.info(
-        f"Dictation system ready.\n"
-        f"  Toggle:  {toggle_key}\n"
-        f"  Cancel:  {cancel_key}\n"
-        f"  Stop:    Ctrl+C\n"
-    )
-    print(
-        f"\nDictation system ready.\n"
-        f"  Press {toggle_key} to start/stop listening.\n"
-        f"  Press {cancel_key} to cancel without injecting.\n"
-        f"  Press Ctrl+C to exit.\n",
-        flush=True,
-    )
+        from tray import DictationTrayIcon
+        config_path = Path(__file__).parent.parent / 'config' / 'settings.yaml'
+        tray = DictationTrayIcon(system, signals, config_path)
+        tray.show()
+        app._tray = tray  # prevent GC
 
-    # Handle Ctrl+C / SIGTERM cleanly
-    def _handle_signal(sig, frame):
-        print("\nShutting down...", flush=True)
-        system.shutdown()
+        overlay_cfg = config.get('overlay', {})
+        if overlay_cfg.get('enabled', True):
+            from overlay import DictationOverlay
+            overlay = DictationOverlay(signals, overlay_cfg)
+            app._overlay = overlay
 
-    signal.signal(signal.SIGINT, _handle_signal)
-    signal.signal(signal.SIGTERM, _handle_signal)
+        logging.info(
+            f"Dictation system ready.\n"
+            f"  Toggle:  {toggle_key}\n"
+            f"  Cancel:  {cancel_key}\n"
+            f"  Stop:    Ctrl+C or tray → Exit\n"
+        )
+        print(
+            f"\nDictation system ready.\n"
+            f"  Press {toggle_key} to start/stop listening.\n"
+            f"  Press {cancel_key} to cancel without injecting.\n"
+            f"  Press Ctrl+C or use the tray menu to exit.\n",
+            flush=True,
+        )
 
-    system.wait_for_shutdown()
+    QTimer.singleShot(0, _deferred_startup)
+    sys.exit(app.exec())
 
 
 if __name__ == '__main__':

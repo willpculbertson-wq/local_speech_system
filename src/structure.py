@@ -34,8 +34,8 @@ _SPOKEN_PUNCTUATION: list[tuple[re.Pattern, str]] = [
     (re.compile(r'\b(?:close|right)\s+paren(?:thesis)?\b', re.IGNORECASE), ')'),
     (re.compile(r'\bquestion\s+mark\b', re.IGNORECASE),        '?'),
     (re.compile(r'\bexclamation\s+(?:point|mark)\b', re.IGNORECASE), '!'),
-    (re.compile(r'\bnew\s+paragraph\b', re.IGNORECASE),        '\n\n'),
-    (re.compile(r'\bnew\s+line\b', re.IGNORECASE),             '\n'),
+    (re.compile(r'\bnew\s+paragraph\b', re.IGNORECASE),        '\r\r'),
+    (re.compile(r'\bnew\s+line\b', re.IGNORECASE),             '\r'),
     (re.compile(r'\bperiod\b', re.IGNORECASE),                 '.'),
     (re.compile(r'\bcomma\b', re.IGNORECASE),                  ','),
     (re.compile(r'\bcolon\b', re.IGNORECASE),                  ':'),
@@ -84,10 +84,13 @@ def _fix_punctuation_spacing(text: str) -> str:
     # No space after '(' and no space before ')'
     text = re.sub(r'\(\s+', '(', text)
     text = re.sub(r'\s+\)', ')', text)
+    # No space after opening quote; no space before closing quote
+    text = re.sub(r'"\s+', '"', text)
+    text = re.sub(r'\s+"', '"', text)
     # Ensure exactly one space after sentence-ending punctuation (not at end of string)
     text = re.sub(r'([.!?])(?=[^\s\n])', r'\1 ', text)
-    # Collapse any double spaces
-    return re.sub(r'  +', ' ', text).strip()
+    # Collapse any double spaces; strip spaces only (preserve \r newline markers)
+    return re.sub(r'  +', ' ', text).strip(' ')
 
 
 def _capitalize_sentences(text: str) -> str:
