@@ -98,7 +98,7 @@ class DictationTrayIcon(QSystemTrayIcon):
             self.setToolTip("Dictation — Processing")
             if self._toggle_action:
                 self._toggle_action.setText("Start Listening")
-        else:  # 'idle'
+        else:  # 'idle' or 'finishing'
             self.setIcon(self._icon_idle)
             self.setToolTip("Dictation — Ready")
             if self._toggle_action:

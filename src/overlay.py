@@ -127,6 +127,17 @@ class DictationOverlay(QWidget):
                 self._anim.stop()
                 self.setWindowOpacity(self._target_opacity)
             self.update()
+        elif state == 'finishing':
+            self._label = 'Finishing'
+            self._renderer = QSvgRenderer(QByteArray(_SVG_MIC_PROCESSING))
+            if not self.isVisible():
+                self.setWindowOpacity(self._target_opacity)
+                self._reposition()
+                self.show()
+            else:
+                self._anim.stop()
+                self.setWindowOpacity(self._target_opacity)
+            self.update()
         else:  # 'idle'
             self._start_fade()
 
