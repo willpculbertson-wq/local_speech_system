@@ -19,6 +19,10 @@ import threading
 import numpy as np
 import torch
 
+# Sentinel posted to input_queue by flush() — VAD emits any partial speech buffer
+# and then forwards a session_end dict downstream.
+_FLUSH_SENTINEL = object()
+
 
 # Whisper hallucinations that sometimes slip through silence padding.
 # Filtered before output to prevent garbage in the pipeline.
@@ -69,6 +73,18 @@ class VADProcessor(threading.Thread):
             if chunk is None:  # Shutdown sentinel
                 break
 
+            if chunk is _FLUSH_SENTINEL:
+                # Graceful stop: emit partial buffer then forward session_end.
+                if in_speech and speech_buffer:
+                    self._maybe_emit(speech_buffer)
+                    speech_buffer = []
+                in_speech = False
+                try:
+                    self.output_queue.put({'type': 'session_end'}, timeout=1.0)
+                except queue.Full:
+                    logging.warning("VAD: speech_queue full, dropping session_end sentinel")
+                continue
+
             # Silero requires a 1-D float32 torch tensor
             tensor = torch.from_numpy(chunk)
 
@@ -99,6 +115,16 @@ class VADProcessor(threading.Thread):
 
     def stop(self):
         self._stop_event.set()
+
+    def flush(self):
+        """Emit any in-progress speech buffer and thread session_end downstream.
+
+        Posts a flush sentinel to input_queue. The VAD thread, when it processes
+        the sentinel, emits whatever speech has accumulated (if in_speech) and
+        then forwards {'type': 'session_end'} to output_queue. This ensures
+        session_end arrives at OutputPipeline only after all transcription results.
+        """
+        self.input_queue.put(_FLUSH_SENTINEL)
 
     def reset(self):
         """Reset VAD state — call when toggling listening OFF to clear any

@@ -191,6 +191,10 @@ class OutputPipeline(threading.Thread):
         self.on_processing_start: 'Callable[[], None] | None' = None
         self.on_session_complete: 'Callable[[], None] | None' = None
         self.on_injection_complete: 'Callable[[], None] | None' = None
+        # Set True by _stop_listening() so session_end sentinel is acted on.
+        # Reset to False by _start_listening() to discard stale sentinels if
+        # the user restarts before the old drain completes.
+        self._expect_session_end: bool = False
 
     def run(self):
         while not self._stop_event.is_set():
@@ -211,10 +215,13 @@ class OutputPipeline(threading.Thread):
                         self._handle_final(msg['text'])
                     elif msg_type == 'session_end':
                         # Session toggled off. Clear indicator only — no injection.
-                        # This runs on OutputThread so it can't race with inject().
-                        self._clear_indicator()
-                        if self.on_session_complete:
-                            self.on_session_complete()
+                        # Only process if _stop_listening() expects this sentinel;
+                        # ignore stale sentinels from a previous session.
+                        if self._expect_session_end:
+                            self._expect_session_end = False
+                            self._clear_indicator()
+                            if self.on_session_complete:
+                                self.on_session_complete()
                     else:
                         logging.warning(f"OutputPipeline: unknown message type {msg_type!r}")
                 else:
@@ -443,6 +450,8 @@ class DictationSystem:
     def _start_listening(self):
         self._listening = True
         self._vad.reset()
+        # Suppress any session_end sentinel still in-flight from a previous drain.
+        self._output_pipeline._expect_session_end = False
         if self._streaming_state is not None:
             self._streaming_state.reset_cancel()
         self._audio.start()
@@ -458,7 +467,9 @@ class DictationSystem:
     def _stop_listening(self):
         self._listening = False
         self._audio.stop()
-        self._vad.reset()
+        # Do NOT call _vad.reset() here — the flush sentinel handles that.
+        # _vad.reset() would reset the model hidden state but leave speech_buffer
+        # as an abandoned local variable; the flush sentinel is the safe path.
         # Prevent OutputPipeline from restarting indicator after the final flush.
         self._output_pipeline._restart_indicator_after_inject = False
         # Mark indicator inactive so _tick_listening / start_listening_sync won't
@@ -466,13 +477,15 @@ class DictationSystem:
         # happen on OutputThread to avoid racing with a concurrent inject().
         if self._indicator is not None:
             self._indicator.stop()
-        # Flush any accumulated text in the buffer.
-        self._buffer.flush_now()
-        # Post a session_end sentinel so OutputThread cleans up the indicator
-        # (handles both the non-empty-buffer case and the empty-buffer case).
-        self._output_queue.put({'type': 'session_end'})
+        # Arm OutputPipeline to act on the session_end sentinel when it arrives.
+        self._output_pipeline._expect_session_end = True
+        # Flush any partial VAD buffer and thread session_end through the full
+        # pipeline (VAD → transcribe → buffer → output).  This guarantees
+        # session_end arrives at OutputPipeline only after all in-flight
+        # transcription results, so no speech is lost when stop is pressed.
+        self._vad.flush()
         if self._signals is not None:
-            self._signals.state_changed.emit('idle')
+            self._signals.state_changed.emit('finishing')
         logging.info("=== LISTENING OFF ===")
         print("[STOPPED]", flush=True)
 

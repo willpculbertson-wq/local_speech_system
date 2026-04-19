@@ -63,6 +63,15 @@ class TranscriptionBuffer(threading.Thread):
                 text = None
 
             if text is not None:
+                if isinstance(text, dict):
+                    # Pipeline sentinel (e.g. session_end) — flush remaining text, then forward.
+                    self._flush('session_end')
+                    try:
+                        self.output_queue.put(text, timeout=2.0)
+                    except queue.Full:
+                        logging.warning("Buffer: output_queue full, dropping session_end sentinel")
+                    continue
+
                 with self._buffer_lock:
                     self._buffer.append(text)
                     self._last_input_time = time.monotonic()

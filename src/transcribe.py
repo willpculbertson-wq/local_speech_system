@@ -104,6 +104,14 @@ class TranscriptionWorker(threading.Thread):
             if audio_segment is None:  # Shutdown sentinel
                 break
 
+            if isinstance(audio_segment, dict):
+                # Pipeline sentinel (e.g. session_end) — forward downstream unchanged.
+                try:
+                    self.output_queue.put(audio_segment, timeout=2.0)
+                except queue.Full:
+                    logging.warning("Transcribe: text_queue full, dropping pipeline sentinel")
+                continue
+
             self._transcribe(audio_segment)
 
     def stop(self):
