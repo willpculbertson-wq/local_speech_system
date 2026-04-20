@@ -44,9 +44,11 @@ from cursor_context import get_preceding_chars
 _INPUT_KEYBOARD = 1
 _KEYEVENTF_KEYUP = 0x0002
 _KEYEVENTF_UNICODE = 0x0004
-_VK_BACK   = 0x08
-_VK_RETURN = 0x0D
-_VK_SHIFT  = 0x10
+_VK_BACK    = 0x08
+_VK_RETURN  = 0x0D
+_VK_SHIFT   = 0x10
+_VK_CONTROL = 0x11
+_VK_MENU    = 0x12  # Alt
 
 
 class _KEYBDINPUT(ctypes.Structure):
@@ -69,6 +71,33 @@ class _INPUT(ctypes.Structure):
 
 _SendInput = ctypes.windll.user32.SendInput
 _INPUT_SIZE = ctypes.sizeof(_INPUT)
+
+
+def _release_phantom_modifiers():
+    """Release modifier keys that are stuck in software but not physically held.
+
+    keyboard.add_hotkey('ctrl+`', suppress=True) suppresses the full combination,
+    but the initial Ctrl keydown was already forwarded to the active application
+    before the library knew '`' would complete the hotkey.  The library injects a
+    synthetic Ctrl keyup to compensate, but this is unreliable when running
+    elevated (administrator mode, required for global keyboard hooks).
+
+    Result: the active app has a Ctrl keydown with no matching keyup → every
+    subsequent keypress is Ctrl-modified (Ctrl+Backspace deletes words, Ctrl+P
+    prints, etc.).
+
+    Fix: send explicit KEYEVENTF_KEYUP for each modifier that is NOT physically
+    held right now.  GetAsyncKeyState checks hardware state (0x8000 = physically
+    pressed), so we never suppress a modifier the user is intentionally holding.
+    """
+    _GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+    for vk in (_VK_CONTROL, _VK_SHIFT, _VK_MENU):
+        if not (_GetAsyncKeyState(vk) & 0x8000):
+            inp = (_INPUT * 1)()
+            inp[0].type = _INPUT_KEYBOARD
+            inp[0].ki.wVk = vk
+            inp[0].ki.dwFlags = _KEYEVENTF_KEYUP
+            _SendInput(1, inp, _INPUT_SIZE)
 
 
 def _capitalize_first(text: str) -> str:
@@ -266,6 +295,7 @@ class OutputInjector:
             inputs[2 * i + 1].ki.wVk = _VK_BACK
             inputs[2 * i + 1].ki.dwFlags = _KEYEVENTF_KEYUP
 
+        _release_phantom_modifiers()
         sent = _SendInput(2 * n, inputs, _INPUT_SIZE)
         if sent != 2 * n:
             logging.warning(f"delete_chars: SendInput sent {sent}/{2 * n} events")
@@ -314,6 +344,7 @@ class OutputInjector:
             inputs[i].ki.dwFlags = flags
 
         with self._lock:
+            _release_phantom_modifiers()
             sent = _SendInput(n, inputs, _INPUT_SIZE)
             if sent != n:
                 logging.warning(f"inject: SendInput sent {sent}/{n} events")
