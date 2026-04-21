@@ -91,6 +91,7 @@ def _release_phantom_modifiers():
     pressed), so we never suppress a modifier the user is intentionally holding.
     """
     _GetAsyncKeyState = ctypes.windll.user32.GetAsyncKeyState
+    _names = {_VK_CONTROL: 'Ctrl', _VK_SHIFT: 'Shift', _VK_MENU: 'Alt'}
     for vk in (_VK_CONTROL, _VK_SHIFT, _VK_MENU):
         if not (_GetAsyncKeyState(vk) & 0x8000):
             inp = (_INPUT * 1)()
@@ -98,6 +99,7 @@ def _release_phantom_modifiers():
             inp[0].ki.wVk = vk
             inp[0].ki.dwFlags = _KEYEVENTF_KEYUP
             _SendInput(1, inp, _INPUT_SIZE)
+            logging.warning(f"Released phantom modifier key: {_names[vk]}")
 
 
 def _capitalize_first(text: str) -> str:

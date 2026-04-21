@@ -22,6 +22,7 @@ NOTE: May require an elevated (Administrator) terminal on Windows for the
 """
 
 import argparse
+import ctypes
 import logging
 import queue
 import signal
@@ -541,9 +542,32 @@ def main():
     toggle_key: str = hotkey_cfg.get('toggle', 'ctrl+`')
     cancel_key: str = hotkey_cfg.get('cancel', 'escape')
 
+    _user32 = ctypes.windll.user32
+
+    def _log_modifier_state(label: str):
+        """Log which modifier keys are physically held at the moment of the call."""
+        ctrl  = bool(_user32.GetAsyncKeyState(0x11) & 0x8000)
+        shift = bool(_user32.GetAsyncKeyState(0x10) & 0x8000)
+        alt   = bool(_user32.GetAsyncKeyState(0x12) & 0x8000)
+        if ctrl or shift or alt:
+            held = [k for k, v in [('Ctrl', ctrl), ('Shift', shift), ('Alt', alt)] if v]
+            logging.info(f"{label}: modifier(s) physically held: {', '.join(held)}")
+        else:
+            logging.debug(f"{label}: no modifiers held")
+
     def _deferred_startup():
         system.start()
-        keyboard.add_hotkey(toggle_key, system.toggle_listening, suppress=True)
+
+        def _toggle_wrapper():
+            # Log modifier state so stuck-Ctrl incidents are visible in dictation.log.
+            _log_modifier_state("toggle_hotkey")
+            system.toggle_listening()
+
+        # suppress=False: all four key events (Ctrl↓ `↓ `↑ Ctrl↑) pass through
+        # to the application normally — balanced, so Ctrl is never unmatched.
+        # suppress=True was causing phantom Ctrl by suppressing the Ctrl keyup
+        # and then fighting against our own _release_phantom_modifiers cleanup.
+        keyboard.add_hotkey(toggle_key, _toggle_wrapper, suppress=False)
         keyboard.add_hotkey(cancel_key, system.cancel_listening, suppress=False)
 
         from tray import DictationTrayIcon
